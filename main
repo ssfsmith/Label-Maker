@@ -283,10 +283,14 @@ class App(ttk.Frame):
         self.serial_col_menu.bind("<<ComboboxSelected>>", lambda e: self._refresh_serials())
 
         ttk.Label(f, text="Serial (row):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        # Allow typing to jump/select by serial quickly
         self.serial_pick_var = tk.StringVar()
-        self.serial_pick_menu = ttk.Combobox(f, textvariable=self.serial_pick_var, width=40, state="readonly")
+        self.serial_pick_menu = ttk.Combobox(f, textvariable=self.serial_pick_var, width=40, state="normal")
         self.serial_pick_menu.grid(row=3, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
         self.serial_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._select_row_by_serial())
+        # Type-to-select handlers
+        self.serial_pick_menu.bind("<KeyRelease>", self._on_serial_typed_data)
+        self.serial_pick_menu.bind("<Return>", self._on_serial_typed_data)
 
         ttk.Button(f, text="Save Data Source", command=self.on_save_data_source).grid(row=4, column=1, sticky="e", pady=(8, 0))
 
@@ -347,8 +351,11 @@ class App(ttk.Frame):
             guess = next((c for c in cols if "serial" in str(c).lower()), cols[0] if cols else "")
             saved_serial_col = self.profile.get("data_source", {}).get("serial_col")
             self.serial_col_var.set(saved_serial_col if saved_serial_col in cols else guess)
+
+            # Populate serials and bindings, then make graph UI ready
             self._refresh_serials()
-            self._refresh_binding_columns()
+            self._ensure_graph_ui_ready()
+
             self._set_status(f"Loaded sheet: {self.sheet_var.get()} ({len(self.df)} rows, {len(self.df.columns)} cols)")
             save_profile(self.profile)
         except Exception as e:
@@ -462,12 +469,15 @@ class App(ttk.Frame):
         ttk.Button(f, text="Save As...", command=self.on_save_as_profile).grid(row=1, column=3, pady=(8, 0))
         ttk.Button(f, text="Delete", command=self.on_delete_profile).grid(row=1, column=4, pady=(8, 0))
 
-        # Profile tab Serial (row) picker (mirrors Data Source tab)
+        # Profile tab Serial (row) picker (mirrors Data Source tab) with typing support
         ttk.Label(f, text="Serial (row):").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.profile_serial_pick_var = tk.StringVar()
-        self.profile_serial_pick_menu = ttk.Combobox(f, textvariable=self.profile_serial_pick_var, width=40, state="readonly")
+        self.profile_serial_pick_menu = ttk.Combobox(f, textvariable=self.profile_serial_pick_var, width=40, state="normal")
         self.profile_serial_pick_menu.grid(row=2, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
         self.profile_serial_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._on_profile_tab_serial_selected())
+        # Type-to-select handlers
+        self.profile_serial_pick_menu.bind("<KeyRelease>", self._on_serial_typed_profile)
+        self.profile_serial_pick_menu.bind("<Return>", self._on_serial_typed_profile)
 
         f.columnconfigure(1, weight=1)
 
@@ -476,7 +486,7 @@ class App(ttk.Frame):
         tf.pack(fill="x", padx=10, pady=(6, 10))
 
         self.include_graph_var = tk.BooleanVar(value=bool(self.profile.get("template", {}).get("include_graph", False)))
-        ttk.Checkbutton(tf, text="Include graph", variable=self.include_graph_var).grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(tf, text="Include graph", variable=self.include_graph_var, command=self._ensure_graph_ui_ready).grid(row=0, column=0, sticky="w", padx=4, pady=4)
 
         ttk.Label(tf, text="Graph scale:").grid(row=0, column=1, sticky="e")
         self.graph_scale_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_scale", 1.0)))
@@ -548,8 +558,7 @@ class App(ttk.Frame):
         # Traces and initial sync
         self._attach_profile_traces()
         self._sync_profile_to_ui()
-        self._toggle_binding_panels()
-        self._update_graph_controls_visibility()
+        self._ensure_graph_ui_ready()
 
     # ========== Bindings tab ==========
     def _build_tab_bindings(self):
@@ -669,11 +678,166 @@ class App(ttk.Frame):
             self._render_selected_cols_view()
         except Exception:
             pass
+        
+    def _ensure_graph_ui_ready(self):
+        """
+        Ensure the graph-related UI is fully initialized and interactive.
+        Call after profiles/sheets load, when creating new profile, or when include_graph flips.
+        """
+        try:
+            self._refresh_binding_columns()
+        except Exception:
+            pass
+        try:
+            self._toggle_binding_panels()
+        except Exception:
+            pass
+        try:
+            self._update_graph_controls_visibility()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_render_selected_cols_view"):
+                self._render_selected_cols_view()
+        except Exception:
+            pass
+    
+    def _match_serial_value(self, text: str, values: List[str]) -> Optional[str]:
+        """
+        Return the best matching serial from values for the typed text.
+        Priority: exact match (case insensitive) > startswith (case insensitive) > contains.
+        """
+        if not text:
+            return None
+        t = text.strip().lower()
+        if not t:
+            return None
+        # Exact
+        for v in values:
+            if v.lower() == t:
+                return v
+        # Startswith
+        for v in values:
+            if v.lower().startswith(t):
+                return v
+        # Contains
+        for v in values:
+            if t in v.lower():
+                return v
+        return None
+
+    def _on_serial_typed_data(self, event=None):
+        """
+        Type-to-select for the Data Source tab serial combobox with true autocomplete.
+        """
+        try:
+            values = list(self.serial_pick_menu["values"]) if hasattr(self, "serial_pick_menu") else []
+            self._autocomplete_serial(self.serial_pick_menu, self.serial_pick_var, values, event, mirror_var=getattr(self, "profile_serial_pick_var", None))
+        except Exception:
+            pass
+
+    def _on_serial_typed_profile(self, event=None):
+        """
+        Type-to-select for the Profile tab serial combobox with true autocomplete.
+        """
+        try:
+            values = list(self.profile_serial_pick_menu["values"]) if hasattr(self, "profile_serial_pick_menu") else []
+            self._autocomplete_serial(self.profile_serial_pick_menu, self.profile_serial_pick_var, values, event, mirror_var=getattr(self, "serial_pick_var", None))
+        except Exception:
+            pass
+
+    def _commit_serial_selection(self, serial_value: str):
+        """
+        Commit the chosen serial across both tabs, select the row, and persist last_serial.
+        """
+        try:
+            # Mirror into both combobox variables if present
+            if hasattr(self, "serial_pick_var") and self.serial_pick_var is not None:
+                self.serial_pick_var.set(serial_value)
+            if hasattr(self, "profile_serial_pick_var") and self.profile_serial_pick_var is not None:
+                self.profile_serial_pick_var.set(serial_value)
+
+            # Select row in DataFrame (if possible)
+            try:
+                self._select_row_by_serial()
+            except Exception:
+                pass
+
+            # Persist into profile
+            try:
+                self.profile.setdefault("data_source", {})["last_serial"] = serial_value
+                save_profile(self.profile)
+            except Exception:
+                pass
+            self._set_status(f"Serial selected: {serial_value}")
+        except Exception:
+            pass
+
+    def _autocomplete_serial(self, combo: ttk.Combobox, var: tk.StringVar, values: List[str], event=None, mirror_var: Optional[tk.StringVar] = None):
+        """
+        Autocomplete behavior for a ttk.Combobox:
+        - Live prefix match; falls back to contains if no prefix match.
+        - Auto-fills with selected completion highlighted for continued typing.
+        - Commit on Enter or exact match.
+        """
+        try:
+            text = (var.get() or "")
+            t = text.strip()
+            vals = values or []
+            if not t:
+                return
+
+            # Key handling: allow navigation keys to pass without changing content, but still
+            # allow BackSpace/Delete to re-suggest based on the new typed prefix.
+            nav_keys = {"Left", "Right", "Home", "End", "Prior", "Next"}  # page up/down, arrows
+            commit_keys = {"Return", "KP_Enter"}
+            if event is not None and event.keysym in nav_keys:
+                return
+
+            # Find best match: prefix first, then contains (case-insensitive)
+            tl = t.lower()
+            match = None
+
+            # Prefix match
+            for v in vals:
+                if v.lower().startswith(tl):
+                    match = v
+                    break
+
+            # Fallback to contains
+            if not match:
+                for v in vals:
+                    if tl in v.lower():
+                        match = v
+                        break
+
+            # If no match, do nothing further
+            if not match:
+                return
+
+            # If Enter pressed or exact match typed, commit the selection
+            if (event is not None and event.keysym in commit_keys) or (match.lower() == tl):
+                self._commit_serial_selection(match)
+                return
+
+            # Otherwise, suggest by auto-filling and selecting the completion part
+            combo.set(match)
+            try:
+                # Place cursor at end of the typed text; select the suggested tail
+                combo.icursor(len(t))
+                combo.selection_range(len(t), len(match))
+            except Exception:
+                pass
+
+            # Do NOT commit yet; let the user continue typing or press Enter to commit
+        except Exception:
+            pass
+
 
     def on_save_bindings(self):
         """
         Save the current bindings (flow columns, slot labels/columns) to the active profile file.
-        Shows a short confirmation and keeps the 'Selected:' summary up to date.
+        Shows a short confirmation and keeps the right-side selected list up to date.
         """
         try:
             # Ensure the latest UI selections are written into the profile dict
@@ -682,10 +846,10 @@ class App(ttk.Frame):
             # Persist to disk
             save_profile(self.profile)
 
-            # Refresh the visible summary under the listbox (safe if helper exists)
+            # Refresh the visible right-side list
             try:
-                if hasattr(self, "_update_selected_cols_label"):
-                    self._update_selected_cols_label()
+                if hasattr(self, "_render_selected_cols_view"):
+                    self._render_selected_cols_view()
             except Exception:
                 pass
 
@@ -873,6 +1037,7 @@ class App(ttk.Frame):
         # Template & layout
         self.profile.setdefault("template", {})
         try:
+            # Read live UI state for include_graph to avoid stale profile reads
             self.profile["template"]["include_graph"] = bool(self.include_graph_var.get())
         except Exception:
             pass
@@ -909,7 +1074,12 @@ class App(ttk.Frame):
 
         # Bindings
         b = self.profile.setdefault("bindings", {})
-        include_graph = bool(self.profile.get("template", {}).get("include_graph", False))
+
+        # IMPORTANT: decide path using the live toggle, not the persisted dict
+        try:
+            include_graph = bool(self.include_graph_var.get())
+        except Exception:
+            include_graph = bool(self.profile.get("template", {}).get("include_graph", False))
 
         if include_graph:
             # Graph bindings
@@ -918,14 +1088,14 @@ class App(ttk.Frame):
                 b["include_trendline"] = bool(self.bg_inc_trend_var.get())
             except Exception:
                 pass
-            # Flow columns: read directly from listbox items
+            # Flow columns from listbox selection
             try:
                 if getattr(self, "list_cols", None):
                     sel_idx = self.list_cols.curselection()
                     b["x_flow_columns"] = [self.list_cols.get(i) for i in sel_idx]
             except Exception:
                 pass
-            # Slot labels/columns
+            # Graph Value slots
             for i in range(1, 7):
                 try:
                     lbl = self.g_slot_label_vars[i-1].get() if i-1 < len(self.g_slot_label_vars) else ""
@@ -935,7 +1105,7 @@ class App(ttk.Frame):
                 except Exception:
                     pass
         else:
-            # Value bindings
+            # Value bindings (non-graph)
             try:
                 b["title"] = self.bv_title_var.get().strip() or "Neb Label"
                 b["subtitle"] = self.bv_subtitle_var.get().strip()
@@ -975,8 +1145,7 @@ class App(ttk.Frame):
 
         - Populates the Flow columns (X) listbox with current df columns.
         - Re-applies saved selections from profile['bindings']['x_flow_columns'].
-        - Keeps selection highlight visible (exportselection=False assumed in builder).
-        - Updates the right-side selected text panel via _render_selected_cols_view().
+        - Updates the right-side selected text panel.
         - Populates slot column comboboxes (graph and non-graph) with df columns
         and re-applies saved selections that still exist.
         - Defensive: safe if widgets or df are not yet available.
@@ -992,12 +1161,8 @@ class App(ttk.Frame):
             b = self.profile.get("bindings", {}) if getattr(self, "profile", None) else {}
         except Exception:
             b = {}
-        try:
-            include_graph = bool(self.profile.get("template", {}).get("include_graph", False))
-        except Exception:
-            include_graph = False
 
-        # 3) Flow columns listbox (Graph mode)
+        # 3) Flow columns listbox
         try:
             if hasattr(self, "list_cols") and self.list_cols is not None:
                 # Refresh entries
@@ -1044,7 +1209,6 @@ class App(ttk.Frame):
                 key = f"slot{i}_col"
                 val = b.get(key, "") or ""
                 try:
-                    # Prefer updating the StringVar if present (keeps combobox in sync)
                     if i - 1 < len(getattr(self, "g_slot_col_vars", [])):
                         self.g_slot_col_vars[i - 1].set(val if val in cols else "")
                     elif i - 1 < len(getattr(self, "g_slot_col_cbs", [])):
@@ -1082,7 +1246,7 @@ class App(ttk.Frame):
         except Exception:
             pass
 
-        # 7) Reflect graph/value mode enable/disable states (if helper exists)
+        # 7) Reflect graph/value mode enable/disable states
         try:
             if hasattr(self, "_update_graph_controls_visibility"):
                 self._update_graph_controls_visibility()
@@ -1397,7 +1561,19 @@ class App(ttk.Frame):
             if "template" not in self.profile:
                 self.profile["template"] = {}
             self.profile_name_var.set(self.profile.get("profile_name", name))
+
+            # Sync all UI from profile (this loads sheet if present)
             self._sync_profile_to_ui()
+
+            # Make sure Bindings tab widgets are correctly enabled/disabled and populated
+            self._ensure_graph_ui_ready()
+
+            # Update header text
+            try:
+                self._update_profile_header()
+            except Exception:
+                pass
+
             self._set_status(f"Profile loaded: {name}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load profile: {e}")
@@ -1406,6 +1582,7 @@ class App(ttk.Frame):
         """
         Create a fresh profile using the default template settings.
         Keeps current Data Source selections (xlsx/sheet/serial) so you don't have to re-pick.
+        Ensures graph bindings are enabled and selectable immediately.
         """
         try:
             # Start with a fresh profile model
@@ -1443,8 +1620,17 @@ class App(ttk.Frame):
             except Exception:
                 pass
 
-            # Re-apply to UI
+            # Force Include Graph ON for new graph profile so widgets aren't greyed out
+            try:
+                self.include_graph_var.set(True)
+                self.profile.setdefault("template", {})["include_graph"] = True
+            except Exception:
+                pass
+
+            # Re-apply to UI and make graph UI ready
             self._sync_profile_to_ui()
+            self._ensure_graph_ui_ready()
+
             # Don’t save automatically; user can Save or Save As to name it
             self._set_status(f"New profile created: {self.profile.get('profile_name', 'Profile')}")
         except Exception as e:
