@@ -1,655 +1,314 @@
-import os
-import re
-import sys
-import json
+"""
+Label Maker (Profiles) - single-file app
+
+- Profile tab: Template & Layout + Output (persisted in profile)
+- Bindings tab: Graph bindings and Value bindings (scrollable, persisted)
+- Actions tab: Preview & Generate
+- Data Source tab (last): Excel path, sheet, serial selection + Save button
+
+Bindings persistence:
+- Flow columns (X) listbox: saved on selection
+- Graph Value slots: label entries saved on focus-out; column comboboxes saved on selection
+- Non-graph Value bindings: same behavior
+- Explicit "Save Bindings" button writes to disk and flashes confirmation
+
+Output persistence:
+- Output target, filename pattern, copies, open-after, output folder
+"""
+
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Dict, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")  # headless backend for saving PDFs
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.patches import Rectangle
 
-APP_TITLE = "Neb Label Printer"
+from render import (
+    PROFILE_DIR,
+    TEMPLATE_GRAPH, TEMPLATE_VALUE_A, TEMPLATE_VALUE_B, TEMPLATE_VALUE_C,
+    TARGET_LETTER_TWO_UP, TARGET_LX900_3x4,
+    DEFAULT_TITLE_COLOR, DEFAULT_TEXT_SCALE_PCT, DEFAULT_MARGIN_PCT, DEFAULT_PLOT_WIDTH_PCT,
+    read_excel_sheet_names, read_excel_sheet, list_profiles, default_profile, save_profile, load_profile,
+    render_profile_to_pdf,
+)
 
-# Defaults
-DEFAULT_LABEL_W_IN = 2.0
-DEFAULT_LABEL_H_IN = 1.0
-DEFAULT_TITLE = "Neb Label"
-DEFAULT_TITLE_COLOR = "#1e6fff"  # blue
-DEFAULT_MARGIN_PCT = 7           # outer margins as % of figure
-DEFAULT_TEXT_SCALE_PCT = 100     # text scale percent (100% = baseline)
-PLOT_DPI = 300
+APP_TITLE = "Label Maker (Profiles)"
 
+class ScrollableFrame(ttk.Frame):
+    """Scrollable area that auto-disables scrolling when not needed."""
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
 
-def default_settings_path() -> Path:
-    if sys.platform.startswith("win"):
-        base = Path(os.getenv("LOCALAPPDATA", Path.home()))
-        return base / "NebLabelPrinter" / "settings.json"
-    else:
-        return Path.home() / ".neb_label_printer.json"
-
-
-def read_excel_sheet_names(xlsx_path: str) -> List[str]:
-    xl = pd.ExcelFile(xlsx_path)
-    try:
-        return xl.sheet_names
-    finally:
+        # Match TTK frame background so it doesn't look like a gray box
         try:
-            xl.close()
+            style = ttk.Style()
+            bg = style.lookup("TFrame", "background") or self.cget("background")
+        except Exception:
+            bg = self.cget("background")
+
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=bg)
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        # Place inner frame and keep a reference to the window id
+        self._window_id = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+
+        # When inner content changes size -> update scrollregion and scrollbar visibility
+        self.scrollable_frame.bind("<Configure>", lambda e: self._on_frame_configure())
+        # When canvas changes size -> stretch inner frame to canvas width and reevaluate
+        self.canvas.bind("<Configure>", lambda e: self._on_canvas_configure())
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vscroll.pack(side="right", fill="y")
+
+        # Mouse wheel binding is toggled depending on need
+        self._wheel_bound = False
+
+    def _on_frame_configure(self):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         except Exception:
             pass
+        self._update_scrollbar_visibility()
 
-
-def read_excel_sheet(xlsx_path: str, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(xlsx_path, sheet_name=sheet_name)
-
-
-def extract_first_float_from_text(text: str) -> Optional[float]:
-    if not isinstance(text, str):
-        return None
-    m = re.search(r"([-+]?\d+(?:\.\d+)?)", text)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
-def parse_flow_xy_from_columns(row: pd.Series, col_names: List[str]) -> Tuple[List[float], List[float]]:
-    """
-    Build (x, y) from a single row across selected columns.
-    - x comes from the first float in the header (e.g., '0.5 L/min'); if none, uses 1,2,3…
-    - y is the numeric in the row cell.
-    Returns x,y sorted by x ascending.
-    """
-    xs: List[float] = []
-    ys: List[float] = []
-    next_idx = 1.0
-    for c in col_names:
-        y = row.get(c, None)
-        x = extract_first_float_from_text(str(c))
-        if x is None:
-            x = next_idx
-            next_idx += 1.0
+    def _on_canvas_configure(self):
+        # Stretch inner frame to the canvas width to avoid narrow “box”
         try:
-            yn = float(y)
-        except Exception:
-            yn = None
-        if yn is not None and np.isfinite(yn):
-            xs.append(float(x))
-            ys.append(float(yn))
-    # Sort by x so plot is ordered
-    if xs and ys and len(xs) == len(ys):
-        order = np.argsort(xs)
-        xs = [xs[i] for i in order]
-        ys = [ys[i] for i in order]
-    return xs, ys
-
-
-def make_plot_ax(
-    ax,
-    xs: List[float],
-    ys: List[float],
-    include_trendline: bool,
-    axis_label_fs: float,
-    tick_fs: float,
-):
-    ax.clear()
-    if not xs or not ys:
-        ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=max(6, tick_fs))
-        ax.axis("off")
-        return
-    # Aesthetics tuned for small labels
-    ax.plot(xs, ys, "-o", linewidth=1.0, markersize=2.5, color="#1a1a1a", label="Data")
-    ax.set_xlabel("Air flow rate (L/min)", fontsize=axis_label_fs)
-    ax.set_ylabel("Self-aspiration rate (µL/min)", fontsize=axis_label_fs)
-    ax.tick_params(axis="both", labelsize=tick_fs, pad=2)
-    ax.grid(True, linewidth=0.3, alpha=0.5)
-    ax.margins(x=0.05, y=0.12)
-
-    if include_trendline and len(xs) >= 2:
-        try:
-            coef = np.polyfit(xs, ys, 1)
-            xfit = np.linspace(min(xs), max(xs), 100)
-            yfit = np.polyval(coef, xfit)
-            ax.plot(xfit, yfit, "-", color="#2b7bff", linewidth=1.0, label="Trend")
-            ax.legend(loc="best", fontsize=max(6, tick_fs - 1))
+            self.canvas.itemconfigure(self._window_id, width=self.canvas.winfo_width())
         except Exception:
             pass
+        self._update_scrollbar_visibility()
 
-
-def _fmt_val(v: Optional[float], ndig: int = 2) -> str:
-    try:
-        if v is None or (hasattr(pd, "isna") and pd.isna(v)) or not np.isfinite(float(v)):
-            return ""
-        return f"{float(v):.{ndig}f}"
-    except Exception:
-        return ""
-
-
-def _coerce_color_hex(s: str, fallback: str = DEFAULT_TITLE_COLOR) -> str:
-    """Return a valid #RRGGBB hex or fallback."""
-    ss = (s or "").strip()
-    if re.fullmatch(r"#([0-9a-fA-F]{6})", ss):
-        return ss
-    return fallback
-
-
-def render_pdf_label_matplotlib(
-    out_pdf: Path,
-    title_text: str,
-    title_color: str,
-    label_w_in: float,
-    label_h_in: float,
-    serial_value: str,
-    backpressure_label: str,
-    backpressure_value: Optional[float],
-    vacuum_label: str,
-    vacuum_value: Optional[float],
-    flow_list_text: List[str],
-    xs: List[float],
-    ys: List[float],
-    include_trendline: bool,
-    leak_check: bool,
-    visual_check: bool,
-    plot_width_pct: int,
-    text_scale_pct: int,
-    margin_pct: int,
-):
-    # Scale factors
-    tscale = max(50, min(200, int(text_scale_pct))) / 100.0  # clamp 50–200%
-    # Base font sizes (pts), multiplied by tscale
-    fs_title   = 11.0 * tscale
-    fs_section = 8.5  * tscale
-    fs_body    = 8.0  * tscale
-    fs_italic  = 7.5  * tscale
-    fs_flow    = 7.2  * tscale
-    fs_axis    = 7.0  * tscale
-    fs_tick    = 6.0  * tscale
-
-    # Vertical spacing scale: close to tscale but a bit conservative
-    vscale = min(1.6, max(0.7, tscale))
-
-    # Margins (fraction of figure)
-    margin_frac = max(0, min(25, int(margin_pct))) / 100.0
-
-    fig = plt.figure(figsize=(label_w_in, label_h_in), dpi=PLOT_DPI)
-    fig.subplots_adjust(0, 0, 1, 1)
-
-    # Outer border
-    fig.add_artist(Rectangle((0.003, 0.003), 0.994, 0.994, transform=fig.transFigure,
-                             fill=False, linewidth=1, edgecolor="black"))
-
-    lm = margin_frac
-    rm = margin_frac
-    tm = margin_frac
-    bm = margin_frac
-
-    total_w = 1 - lm - rm
-    total_h = 1 - tm - bm
-
-    plot_width_pct = max(30, min(80, int(plot_width_pct)))
-    right_frac = plot_width_pct / 100.0
-    left_w_frac = 1.0 - right_frac
-    gap = 0.012
-    right_w = max(0.01, total_w * right_frac - gap)
-
-    # Left text column
-    axL = fig.add_axes([lm, bm, total_w * left_w_frac, total_h])
-    axL.axis("off")
-
-    # Right plot column
-    axR = fig.add_axes([lm + total_w * left_w_frac + gap, bm, right_w, total_h])
-
-    # Left column content with scaled spacing
-    y = 0.98
-    axL.text(0.0, y, title_text, color=_coerce_color_hex(title_color), fontsize=fs_title,
-             fontweight="bold", va="top", ha="left", transform=axL.transAxes)
-    y -= 0.10 * vscale
-
-    axL.text(0.0, y, "Calibration Data", color="black", fontsize=fs_section, va="top",
-             ha="left", transform=axL.transAxes)
-    y -= 0.10 * vscale
-
-    axL.text(0.0, y, f"Serial Number: {serial_value}", fontsize=fs_body, va="top",
-             ha="left", transform=axL.transAxes)
-    y -= 0.08 * vscale
-
-    bp_val = _fmt_val(backpressure_value, 2)
-    axL.text(0.0, y, f"{backpressure_label}: {bp_val}", fontsize=fs_body, va="top",
-             ha="left", transform=axL.transAxes)
-    y -= 0.08 * vscale
-
-    vac_val = _fmt_val(vacuum_value, 2)
-    axL.text(0.0, y, f"{vacuum_label}: {vac_val}", fontsize=fs_body, va="top",
-             ha="left", transform=axL.transAxes)
-    y -= 0.10 * vscale
-
-    axL.text(0.0, y, "Air flow rate (L/min)", fontsize=fs_italic, style="italic",
-             va="top", ha="left", transform=axL.transAxes)
-    y -= 0.08 * vscale
-
-    axL.text(0.0, y, "Self-aspiration rate (µL/min)", fontsize=fs_italic, style="italic",
-             va="top", ha="left", transform=axL.transAxes)
-    y -= 0.10 * vscale
-
-    # Flow list (truncate if needed to avoid the checkboxes area)
-    for item in flow_list_text:
-        if y < (0.20 if vscale >= 1.0 else 0.20 * vscale):
-            break
-        axL.text(0.0, y, item, fontsize=fs_flow, va="top", ha="left", transform=axL.transAxes)
-        y -= 0.07 * vscale
-
-    # Checkboxes (scale size modestly)
-    def draw_checkbox(ax, x, ytop, label, checked):
-        base_w, base_h = 0.05, 0.06
-        cscale = min(1.4, max(0.8, tscale))
-        box_w = base_w * cscale
-        box_h = base_h * cscale
-        ax.add_patch(Rectangle((x, ytop - box_h), box_w, box_h, fill=False, linewidth=0.8,
-                               transform=ax.transAxes, clip_on=False, color="black"))
-        if checked:
-            ax.plot([x + 0.01, x + 0.02, x + box_w - 0.01],
-                    [ytop - box_h + 0.02, ytop - 0.01, ytop - box_h + 0.02],
-                    color="black", linewidth=1, transform=ax.transAxes, clip_on=False)
-        ax.text(x + box_w + 0.02, ytop - box_h + 0.01, label, fontsize=fs_body,
-                va="bottom", ha="left", transform=ax.transAxes)
-
-    y_cb = max(y - 0.04 * vscale, 0.18)
-    draw_checkbox(axL, 0.0, y_cb, "Leak check", leak_check)
-    draw_checkbox(axL, 0.0, y_cb - (0.10 * vscale), "Visual inspection", visual_check)
-
-    # Right plot
-    make_plot_ax(axR, xs, ys, include_trendline, axis_label_fs=fs_axis, tick_fs=fs_tick)
-
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    with PdfPages(out_pdf) as pp:
-        pp.savefig(fig, dpi=PLOT_DPI, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
-
-
-def pick_best_column_match(columns: List[str], keywords: List[str]) -> Optional[str]:
-    lowered = [(c, str(c).lower()) for c in columns]
-    for c, lc in lowered:
-        if all(kw in lc for kw in keywords):
-            return c
-    return None
-
-
-def _likely_flow_header(name: str) -> bool:
-    """Heuristic: select headers that look like flow setpoints or contain 'flow'."""
-    s = (name or "").lower()
-    if "flow" in s:
-        return True
-    return extract_first_float_from_text(name) is not None
-
-
-class ScrolledCheckFrame(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
-        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vsb.set)
-        self.inner = ttk.Frame(self.canvas)
-
-        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vsb.grid(row=0, column=1, sticky="ns")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        self.vars: List[tk.BooleanVar] = []
-        self.cbs: List[tk.Checkbutton] = []
-        for i in range(1, 21):
-            var = tk.BooleanVar(value=False)
-            cb = tk.Checkbutton(self.inner, text=f"Column {i}", variable=var, anchor="w", justify="left")
-            cb.grid(row=i - 1, column=0, sticky="w", padx=4, pady=1)
-            cb.grid_remove()
-            self.vars.append(var)
-            self.cbs.append(cb)
-
-        btn_row = ttk.Frame(self.inner)
-        btn_row.grid(row=21, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(btn_row, text="Select all", command=self.select_all).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(btn_row, text="Select none", command=self.select_none).grid(row=0, column=1)
-
-        self.columns: List[str] = []
-
-    def load_columns(self, columns: List[str]):
-        self.columns = list(columns)
-        for i, cb in enumerate(self.cbs, start=1):
-            if i - 1 < len(self.columns):
-                name = str(self.columns[i - 1])
-                default_on = _likely_flow_header(name)
-                cb.configure(text=f"Column {i}: {name}")
-                self.vars[i - 1].set(default_on)
-                cb.grid()
-            else:
-                self.vars[i - 1].set(False)
-                cb.grid_remove()
-
-    def apply_selected_names(self, names: List[str]):
-        name_set = set(names or [])
-        for i in range(1, 21):
-            if i - 1 < len(self.columns):
-                self.vars[i - 1].set(self.columns[i - 1] in name_set)
-            else:
-                self.vars[i - 1].set(False)
-
-    def selected_columns(self) -> List[str]:
-        cols: List[str] = []
-        for i, var in enumerate(self.vars, start=1):
-            if var.get() and (i - 1) < len(self.columns):
-                cols.append(self.columns[i - 1])
-        # Keep selection ordered by numeric header value if present
-        cols_sorted = sorted(
-            cols,
-            key=lambda c: (extract_first_float_from_text(str(c)) is None,
-                           extract_first_float_from_text(str(c)) or float("inf"))
-        )
-        return cols_sorted
-
-    def select_all(self):
-        for i, var in enumerate(self.vars, start=1):
-            if (i - 1) < len(self.columns):
-                var.set(True)
-
-    def select_none(self):
-        for i, var in enumerate(self.vars, start=1):
-            if (i - 1) < len(self.columns):
-                var.set(False)
-
-
-class SettingsManager:
-    def __init__(self, path: Optional[Path] = None):
-        self.path = path or default_settings_path()
-        self.data = {}
-
-    def load(self):
+    def _update_scrollbar_visibility(self):
+        # Show scrollbar and enable wheel only if content is taller than viewport
         try:
-            if self.path.exists():
-                with self.path.open("r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            else:
-                self.data = {}
+            need = self.scrollable_frame.winfo_reqheight() > self.canvas.winfo_height()
         except Exception:
-            self.data = {}
+            need = False
 
-    def save(self):
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2)
-        except Exception as e:
-            messagebox.showwarning("Settings", f"Could not save settings: {e}")
+        if need:
+            # ensure connections and show bar
+            self.canvas.configure(yscrollcommand=self.vscroll.set)
+            if not self.vscroll.winfo_ismapped():
+                self.vscroll.pack(side="right", fill="y")
+            self._bind_wheel()
+        else:
+            # lock at top and hide bar
+            try:
+                self.canvas.yview_moveto(0)
+            except Exception:
+                pass
+            if self.vscroll.winfo_ismapped():
+                self.vscroll.pack_forget()
+            self.canvas.configure(yscrollcommand=None)
+            self._unbind_wheel()
 
-    def clear(self):
+    def _bind_wheel(self):
+        if self._wheel_bound:
+            return
+        for w in (self.canvas, self.scrollable_frame):
+            # Windows/macOS
+            w.bind("<MouseWheel>", self._on_mousewheel)
+            # Linux
+            w.bind("<Button-4>", self._on_mousewheel)
+            w.bind("<Button-5>", self._on_mousewheel)
+        self._wheel_bound = True
+
+    def _unbind_wheel(self):
+        if not self._wheel_bound:
+            return
+        for w in (self.canvas, self.scrollable_frame):
+            w.unbind("<MouseWheel>")
+            w.unbind("<Button-4>")
+            w.unbind("<Button-5>")
+        self._wheel_bound = False
+
+    def _on_mousewheel(self, event):
         try:
-            if self.path.exists():
-                self.path.unlink()
+            # Linux (button-based)
+            if getattr(event, "num", None) == 4:
+                self.canvas.yview_scroll(-1, "units"); return
+            if getattr(event, "num", None) == 5:
+                self.canvas.yview_scroll(1, "units"); return
+            # Windows/macOS (delta-based)
+            if event.delta < 0:
+                self.canvas.yview_scroll(1, "units")
+            elif event.delta > 0:
+                self.canvas.yview_scroll(-1, "units")
         except Exception:
             pass
-        self.data = {}
-
-
-def _find_serial_column(cols: List[str]) -> Optional[str]:
-    for c in cols:
-        s = str(c).strip().lower()
-        if "serial" in s:
-            return c
-    return None
-
 
 class App(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.master.title(APP_TITLE)
         self.pack(fill="both", expand=True)
+
+        # State
         self.df: Optional[pd.DataFrame] = None
         self.xlsx_path: Optional[str] = None
+        self.current_row_index: Optional[int] = None
+        self.profile: Dict = default_profile(TEMPLATE_GRAPH)
         self.last_pdf: Optional[Path] = None
 
-        self.settings = SettingsManager()
-        self.settings.load()
+        # Vars that are referenced in multiple tabs — define early
+        self.outdir_var = tk.StringVar(value=str(Path.cwd()))
 
-        # Top: file picker
-        file_frame = ttk.Frame(self)
-        file_frame.pack(fill="x", padx=8, pady=6)
+        # Keep references to comboboxes
+        self.slot_col_cbs: List[ttk.Combobox] = []
+        self.g_slot_col_cbs: List[ttk.Combobox] = []
 
-        ttk.Label(file_frame, text="Excel file:").pack(side="left")
-        self.xlsx_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.xlsx_var, width=60).pack(side="left", padx=6)
-        ttk.Button(file_frame, text="Browse...", command=self.on_browse).pack(side="left")
+        # Autosave debounce
+        self._autosave_after_id = None
 
-        # Sheet + Serial row
-        sheet_serial = ttk.Frame(self)
-        sheet_serial.pack(fill="x", padx=8, pady=4)
+        # Style
+        self._init_style()
 
-        ttk.Label(sheet_serial, text="Sheet:").pack(side="left")
-        self.sheet_var = tk.StringVar()
-        self.sheet_menu = ttk.Combobox(sheet_serial, textvariable=self.sheet_var, width=28, state="readonly")
-        self.sheet_menu.pack(side="left", padx=(4, 16))
-        self.sheet_menu.bind("<<ComboboxSelected>>", lambda e: self.load_sheet())
+        # Notebook
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=6)
 
-        ttk.Label(sheet_serial, text="Serial:").pack(side="left")
-        self.serial_var = tk.StringVar()
-        self.serial_menu = ttk.Combobox(sheet_serial, textvariable=self.serial_var, width=24, state="readonly")
-        self.serial_menu.pack(side="left", padx=(4, 0))
+        # Build tabs: Profile, Bindings, Actions, Data Source (last)
+        self._build_tab_profiles()
+        self._build_tab_bindings()
+        self._build_tab_actions()
+        self._build_tab_data()
 
-        # Title/color row
-        title_frame = ttk.Frame(self)
-        title_frame.pack(fill="x", padx=8, pady=4)
-
-        ttk.Label(title_frame, text="Title:").pack(side="left")
-        self.title_var = tk.StringVar(value=self.settings.data.get("title", DEFAULT_TITLE))
-        ttk.Entry(title_frame, textvariable=self.title_var, width=28).pack(side="left", padx=(4, 16))
-
-        ttk.Label(title_frame, text="Color (hex):").pack(side="left")
-        self.title_color_var = tk.StringVar(value=self.settings.data.get("title_color", DEFAULT_TITLE_COLOR))
-        ttk.Entry(title_frame, textvariable=self.title_color_var, width=12).pack(side="left")
-
-        # Size/plot row
-        dims_frame = ttk.Frame(self)
-        dims_frame.pack(fill="x", padx=8, pady=4)
-
-        ttk.Label(dims_frame, text="Label size (in):").pack(side="left")
-        ttk.Label(dims_frame, text="W").pack(side="left")
-        self.win_var = tk.StringVar(value=str(self.settings.data.get("label_w_in", DEFAULT_LABEL_W_IN)))
-        ttk.Entry(dims_frame, textvariable=self.win_var, width=6).pack(side="left", padx=(2, 8))
-
-        ttk.Label(dims_frame, text="H").pack(side="left")
-        self.hin_var = tk.StringVar(value=str(self.settings.data.get("label_h_in", DEFAULT_LABEL_H_IN)))
-        ttk.Entry(dims_frame, textvariable=self.hin_var, width=6).pack(side="left", padx=(2, 16))
-
-        # Plot width % (Spinbox 30–80)
-        ttk.Label(dims_frame, text="Plot width %").pack(side="left")
-
-        self.plotw_var = tk.IntVar(value=int(self.settings.data.get("plot_width_pct", 52)))
-        self.plotw_sb = tk.Spinbox(
-            dims_frame,
-            from_=30, to=80, increment=1,
-            textvariable=self.plotw_var, width=5, justify="right"
-        )
-        self.plotw_sb.pack(side="left", padx=(4, 12))
-
-        # Clamp to range on Enter/blur
-        self._bind_spinbox_int(self.plotw_sb, self.plotw_var, 30, 80, 52)
-
-        self.trend_var = tk.BooleanVar(value=bool(self.settings.data.get("trendline", True)))
-        ttk.Checkbutton(dims_frame, text="Include trendline", variable=self.trend_var).pack(side="left")
-
-        # Typography & margins row
-        typo_frame = ttk.Frame(self)
-        typo_frame.pack(fill="x", padx=8, pady=4)
-        # Text scale % (Spinbox 60–160)
-        ttk.Label(typo_frame, text="Text scale %").pack(side="left")
-        self.text_scale_var = tk.IntVar(value=int(self.settings.data.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
-        self.text_scale_sb = tk.Spinbox(
-            typo_frame,
-            from_=60, to=160, increment=1,
-            textvariable=self.text_scale_var, width=5, justify="right"
-)
-        self.text_scale_sb.pack(side="left", padx=(4, 16))
-        self._bind_spinbox_int(self.text_scale_sb, self.text_scale_var, 60, 160, DEFAULT_TEXT_SCALE_PCT)
-
-        # Margins % (Spinbox 3–15)
-        ttk.Label(typo_frame, text="Margins %").pack(side="left")
-        self.margin_var = tk.IntVar(value=int(self.settings.data.get("margin_pct", DEFAULT_MARGIN_PCT)))
-        self.margin_sb = tk.Spinbox(
-            typo_frame,
-            from_=3, to=15, increment=1,
-            textvariable=self.margin_var, width=5, justify="right"
-        )
-        self.margin_sb.pack(side="left", padx=(4, 0))
-        self._bind_spinbox_int(self.margin_sb, self.margin_var, 3, 15, DEFAULT_MARGIN_PCT)
-
-
-
-        # Backpressure/Vacuum selectors
-        bp_vac = ttk.Frame(self)
-        bp_vac.pack(fill="x", padx=8, pady=4)
-
-        ttk.Label(bp_vac, text="Backpressure column:").pack(side="left")
-        self.bp_col_var = tk.StringVar()
-        self.bp_col_menu = ttk.Combobox(bp_vac, textvariable=self.bp_col_var, width=32, state="readonly")
-        self.bp_col_menu.pack(side="left", padx=(4, 16))
-
-        ttk.Label(bp_vac, text="Vacuum column:").pack(side="left")
-        self.vc_col_var = tk.StringVar()
-        self.vc_col_menu = ttk.Combobox(bp_vac, textvariable=self.vc_col_var, width=32, state="readonly")
-        self.vc_col_menu.pack(side="left", padx=(4, 0))
-
-        # Columns chooser
-        cols_frame = ttk.LabelFrame(self, text="Choose columns (1–20) to plot (in order)")
-        cols_frame.pack(fill="both", padx=8, pady=8, expand=True)
-        self.scrolled_checks = ScrolledCheckFrame(cols_frame)
-        self.scrolled_checks.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # Checkboxes row
-        checks = ttk.Frame(self)
-        checks.pack(fill="x", padx=8, pady=4)
-        self.leak_var = tk.BooleanVar(value=bool(self.settings.data.get("leak_check", False)))
-        ttk.Checkbutton(checks, text="Leak check", variable=self.leak_var).pack(side="left", padx=(0, 12))
-        self.visual_var = tk.BooleanVar(value=bool(self.settings.data.get("visual_check", False)))
-        ttk.Checkbutton(checks, text="Visual inspection", variable=self.visual_var).pack(side="left")
-
-        # Output actions
-        out_actions = ttk.Frame(self)
-        out_actions.pack(fill="x", padx=8, pady=6)
-        ttk.Label(out_actions, text="Output folder:").pack(side="left")
-        self.outdir_var = tk.StringVar(value=self.settings.data.get("out_dir", ""))
-        ttk.Entry(out_actions, textvariable=self.outdir_var, width=54).pack(side="left", padx=6)
-        ttk.Button(out_actions, text="Browse...", command=self.on_browse_outdir).pack(side="left", padx=(0, 12))
-        ttk.Button(out_actions, text="Generate PDF", command=self.on_generate).pack(side="left")
-        self.open_btn = ttk.Button(out_actions, text="Open PDF", command=self.on_open_pdf, state="disabled")
-        self.open_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(out_actions, text="Save settings", command=self.on_save_settings).pack(side="left", padx=(12, 0))
-        ttk.Button(out_actions, text="Reset settings", command=self.on_reset_settings).pack(side="left", padx=(6, 0))
-
-        # Status bar
+        # Status
         self.status_var = tk.StringVar(value="")
         status = ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w")
-        status.pack(fill="x", padx=0, pady=(4, 0), ipady=2)
+        status.pack(fill="x", padx=0, pady=(2, 0), ipady=2)
 
-        self.apply_saved_settings()
+        # Profiles list
+        self._refresh_profile_list()
+
+        # Auto-load a profile at startup, if one exists
+        try:
+            names = list_profiles()
+            pref = self.profile.get("profile_name")
+            if pref and pref in names:
+                self.profile_pick_var.set(pref)
+                self._load_selected_profile()
+            elif names:
+                self.profile_pick_var.set(names[0])
+                self._load_selected_profile()
+        except Exception:
+            pass
+
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def set_status(self, msg: str):
-        self.status_var.set(msg)
-        self.update_idletasks()
 
-    def apply_saved_settings(self):
-        s = self.settings.data or {}
+    def _init_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("TLabel", padding=2)
+        style.configure("TButton", padding=4)
+        style.configure("TLabelframe", padding=6)
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        # Header label style: bigger, bold
+        try:
+            style.configure("ProfileHeader.TLabel", font=("Segoe UI", 14, "bold"))
+        except Exception:
+            pass
 
-        # Load Excel (if present)
-        xlsx = s.get("xlsx_path", "")
-        if xlsx and Path(xlsx).exists():
-            self.xlsx_path = xlsx
-            self.xlsx_var.set(xlsx)
-            try:
-                sheets = read_excel_sheet_names(xlsx)
-                self.sheet_menu["values"] = sheets
-                sheet_name = s.get("sheet_name")
-                if sheet_name in sheets:
-                    self.sheet_var.set(sheet_name)
-                elif sheets:
-                    self.sheet_var.set(sheets[0])
-                if self.sheet_var.get():
-                    self.load_sheet()
-            except Exception as e:
-                self.set_status(f"Error reading Excel: {e}")
 
-        # Re-apply saved column and serial selections if df loaded
-        if self.df is not None:
-            cols = list(self.df.columns)
-            # Serials (normalized display)
-            if "_SerialStr" in self.df.columns:
-                serial_vals = [s for s in sorted(self.df["_SerialStr"].dropna().unique().tolist()) if s and s.lower() != "nan"]
-            else:
-                serial_vals = []
-            saved_serial = s.get("serial")
-            if saved_serial and (saved_serial in serial_vals):
-                self.serial_var.set(saved_serial)
+    def _make_profile_header(self, parent) -> ttk.Label:
+        """
+        Create a bold, large header showing the current profile name on a given tab.
+        The label is registered so future name changes update everywhere.
+        """
+        if not hasattr(self, "_profile_header_labels"):
+            self._profile_header_labels = []
+        text = f"Profile: {self.profile.get('profile_name', 'Profile')}"
+        lbl = ttk.Label(parent, text=text, style="ProfileHeader.TLabel")
+        lbl.pack(fill="x", padx=10, pady=(8, 4))
+        self._profile_header_labels.append(lbl)
+        return lbl
 
-            saved_bp = s.get("bp_col"); saved_vc = s.get("vc_col")
-            if saved_bp in cols:
-                self.bp_col_var.set(saved_bp)
-            if saved_vc in cols:
-                self.vc_col_var.set(saved_vc)
+    def _update_profile_header(self):
+        """
+        Update all header labels to reflect the current profile name.
+        Safe if called before labels exist.
+        """
+        try:
+            name = ""
+            if hasattr(self, "profile_name_var") and self.profile_name_var is not None:
+                name = (self.profile_name_var.get() or "").strip()
+            if not name:
+                name = self.profile.get("profile_name", "Profile")
+            text = f"Profile: {name}"
+            for lbl in getattr(self, "_profile_header_labels", []):
+                try:
+                    lbl.config(text=text)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-            saved_selected = s.get("selected_columns_by_name", [])
-            self.scrolled_checks.apply_selected_names(saved_selected)
+    # ========== Data Source (last tab) ==========
+    def _build_tab_data(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="Data Source")
 
-        if not self.outdir_var.get() and self.xlsx_path:
-            self.outdir_var.set(str(Path(self.xlsx_path).parent))
+        # Header (fixed)
+        self._make_profile_header(tab)
 
-    def current_settings(self) -> dict:
-        s = {
-            "title": self.title_var.get().strip() or DEFAULT_TITLE,
-            "title_color": self.title_color_var.get().strip() or DEFAULT_TITLE_COLOR,
-            "label_w_in": safe_float(self.win_var.get(), DEFAULT_LABEL_W_IN),
-            "label_h_in": safe_float(self.hin_var.get(), DEFAULT_LABEL_H_IN),
-            "plot_width_pct": int(self.plotw_var.get()),
-            "trendline": bool(self.trend_var.get()),
-            "leak_check": bool(self.leak_var.get()),
-            "visual_check": bool(self.visual_var.get()),
-            "out_dir": self.outdir_var.get().strip(),
-            "xlsx_path": self.xlsx_path or "",
-            "sheet_name": self.sheet_var.get().strip(),
-            "serial": self.serial_var.get().strip(),
-            "bp_col": self.bp_col_var.get().strip() if self.bp_col_var.get() else "",
-            "vc_col": self.vc_col_var.get().strip() if self.vc_col_var.get() else "",
-            "selected_columns_by_name": self.scrolled_checks.selected_columns(),
-            "text_scale_pct": int(self.text_scale_var.get()),
-            "margin_pct": int(self.margin_var.get()),
-        }
-        return s
+        f = ttk.Frame(tab)
+        f.pack(fill="x", padx=10, pady=10)
 
-    def on_save_settings(self):
-        self.settings.data = self.current_settings()
-        self.settings.save()
-        self.set_status(f"Settings saved to: {self.settings.path}")
+        ttk.Label(f, text="Excel file:").grid(row=0, column=0, sticky="w")
+        self.xlsx_var = tk.StringVar(value=self.profile.get("data_source", {}).get("xlsx_path", ""))
+        ttk.Entry(f, textvariable=self.xlsx_var, width=60).grid(row=0, column=1, sticky="we", padx=(6, 6))
+        ttk.Button(f, text="Browse...", command=self.on_browse_excel).grid(row=0, column=2, sticky="w")
 
-    def on_reset_settings(self):
-        if messagebox.askyesno("Reset settings", "Clear saved settings and revert to defaults?"):
-            self.settings.clear()
-            self.set_status("Settings cleared. Defaults will be used next launch.")
+        ttk.Label(f, text="Sheet:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.sheet_var = tk.StringVar(value=self.profile.get("data_source", {}).get("sheet", ""))
+        self.sheet_menu = ttk.Combobox(f, textvariable=self.sheet_var, width=28, state="readonly")
+        self.sheet_menu.grid(row=1, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
+        self.sheet_menu.bind("<<ComboboxSelected>>", lambda e: self._load_sheet())
 
-    def on_close(self):
-        self.on_save_settings()
-        self.master.destroy()
+        ttk.Label(f, text="Serial column:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.serial_col_var = tk.StringVar(value=self.profile.get("data_source", {}).get("serial_col", ""))
+        self.serial_col_menu = ttk.Combobox(f, textvariable=self.serial_col_var, width=28, state="readonly")
+        self.serial_col_menu.grid(row=2, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
+        self.serial_col_menu.bind("<<ComboboxSelected>>", lambda e: self._refresh_serials())
 
-    def on_browse(self):
+        ttk.Label(f, text="Serial (row):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.serial_pick_var = tk.StringVar()
+        self.serial_pick_menu = ttk.Combobox(f, textvariable=self.serial_pick_var, width=40, state="readonly")
+        self.serial_pick_menu.grid(row=3, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
+        self.serial_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._select_row_by_serial())
+
+        ttk.Button(f, text="Save Data Source", command=self.on_save_data_source).grid(row=4, column=1, sticky="e", pady=(8, 0))
+
+        f.columnconfigure(1, weight=1)
+
+    def on_save_data_source(self):
+        try:
+            self.profile.setdefault("data_source", {})
+            if self.xlsx_var.get():
+                self.profile["data_source"]["xlsx_path"] = self.xlsx_var.get()
+            if self.sheet_var.get():
+                self.profile["data_source"]["sheet"] = self.sheet_var.get()
+            if self.serial_col_var.get():
+                self.profile["data_source"]["serial_col"] = self.serial_col_var.get()
+            if self.serial_pick_var.get():
+                self.profile["data_source"]["last_serial"] = self.serial_pick_var.get()
+            save_profile(self.profile)
+            self._flash_message("Data source saved", 1200)
+        except Exception as e:
+            messagebox.showerror("Save Data Source", f"Failed to save data source: {e}")
+
+    def on_browse_excel(self):
         path = filedialog.askopenfilename(
             title="Select Excel file",
             filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")]
@@ -658,227 +317,1216 @@ class App(ttk.Frame):
             return
         self.xlsx_path = path
         self.xlsx_var.set(path)
+        self.profile.setdefault("data_source", {})
+        self.profile["data_source"]["xlsx_path"] = path
         try:
             sheets = read_excel_sheet_names(path)
             self.sheet_menu["values"] = sheets
             if sheets:
-                self.sheet_var.set(sheets[0])
-                self.load_sheet()
-            if not self.outdir_var.get():
-                self.outdir_var.set(str(Path(path).parent))
-            self.set_status(f"Loaded: {path}")
+                saved_sheet = self.profile.get("data_source", {}).get("sheet")
+                self.sheet_var.set(saved_sheet if (saved_sheet in sheets) else sheets[0])
+                self._load_sheet()
+            self._set_status(f"Loaded: {path}")
+            save_profile(self.profile)
         except Exception as e:
             messagebox.showerror("Error", f"Error reading Excel: {e}")
-            self.set_status(f"Error reading Excel: {e}")
+            self._set_status(f"Error reading Excel: {e}")
 
-    def load_sheet(self):
-        if not self.xlsx_path or not self.sheet_var.get():
+    def _load_sheet(self):
+        if not (self.xlsx_var.get() or self.xlsx_path) or not self.sheet_var.get():
             return
+        path = self.xlsx_var.get() or self.xlsx_path
         try:
-            self.df = read_excel_sheet(self.xlsx_path, self.sheet_var.get())
+            self.df = read_excel_sheet(path, self.sheet_var.get())
+            self.profile.setdefault("data_source", {})
+            self.profile["data_source"]["xlsx_path"] = path
+            self.profile["data_source"]["sheet"] = self.sheet_var.get()
+
             cols = list(self.df.columns)
-
-            # Find serial column; normalize to string for reliable matching/display
-            serial_col = "Serial Number" if "Serial Number" in cols else _find_serial_column(cols)
-            if serial_col:
-                self.df["_SerialStr"] = self.df[serial_col].astype(str).str.strip()
-                serials = [
-                    s for s in sorted(self.df["_SerialStr"].dropna().unique().tolist())
-                    if s and s.lower() != "nan"
-                ]
-            else:
-                serials = []
-
-            # Fill column selection (heuristic preselection)
-            self.scrolled_checks.load_columns(cols)
-
-            # Backpressure/vacuum guesses
-            bp_guess = pick_best_column_match(cols, ["pressure", "@0.7"]) or pick_best_column_match(cols, ["pressure"])
-            vc_guess = pick_best_column_match(cols, ["vacuum", "@0.7"]) or pick_best_column_match(cols, ["vacuum"])
-            self.bp_col_menu["values"] = cols
-            self.vc_col_menu["values"] = cols
-            if not self.bp_col_var.get() and bp_guess:
-                self.bp_col_var.set(bp_guess)
-            if not self.vc_col_var.get() and vc_guess:
-                self.vc_col_var.set(vc_guess)
-
-            # Serials menu (use normalized strings)
-            self.serial_menu["values"] = serials
-            if serials and not self.serial_var.get():
-                self.serial_var.set(serials[0])
-
-            if not self.outdir_var.get():
-                self.outdir_var.set(str(Path(self.xlsx_path).parent))
-            self.set_status(f"Loaded sheet: {self.sheet_var.get()} ({len(self.df)} rows, {len(self.df.columns)} cols)")
+            self.serial_col_menu["values"] = cols
+            guess = next((c for c in cols if "serial" in str(c).lower()), cols[0] if cols else "")
+            saved_serial_col = self.profile.get("data_source", {}).get("serial_col")
+            self.serial_col_var.set(saved_serial_col if saved_serial_col in cols else guess)
+            self._refresh_serials()
+            self._refresh_binding_columns()
+            self._set_status(f"Loaded sheet: {self.sheet_var.get()} ({len(self.df)} rows, {len(self.df.columns)} cols)")
+            save_profile(self.profile)
         except Exception as e:
             self.df = None
             messagebox.showerror("Error", f"Error loading sheet: {e}")
-            self.set_status(f"Error loading sheet: {e}")
+            self._set_status(f"Error loading sheet: {e}")
 
-    def on_browse_outdir(self):
+    def _render_selected_cols_view(self):
+        """
+        Render selected Flow columns (X) top-to-bottom into the read-only text panel
+        to the right of the listbox.
+        """
+        try:
+            if not hasattr(self, "selected_cols_text") or not hasattr(self, "list_cols"):
+                return
+            sel_names = []
+            try:
+                sel_indices = list(self.list_cols.curselection())
+                for i in sel_indices:
+                    sel_names.append(self.list_cols.get(i))
+            except Exception:
+                sel_names = []
+
+            # Update text content
+            self.selected_cols_text.configure(state="normal")
+            self.selected_cols_text.delete("1.0", "end")
+            if sel_names:
+                self.selected_cols_text.insert("1.0", "\n".join(sel_names))
+            else:
+                self.selected_cols_text.insert("1.0", "(none)")
+            self.selected_cols_text.configure(state="disabled")
+        except Exception:
+            pass
+
+
+    def _refresh_serials(self):
+        if self.df is None or not self.serial_col_var.get():
+            self.serial_pick_menu["values"] = []
+            # also clear profile tab serial values
+            try:
+                self._update_profile_serial_menu_values([])
+            except Exception:
+                pass
+            return
+        col = self.serial_col_var.get()
+        try:
+            serials = [str(s).strip() for s in self.df[col].astype(str).fillna("").tolist()]
+            seen, dedup = set(), []
+            for s in serials:
+                if s not in seen:
+                    seen.add(s)
+                    dedup.append(s)
+            self.serial_pick_menu["values"] = dedup
+            # keep Profile tab serial combo in sync
+            try:
+                self._update_profile_serial_menu_values(dedup)
+            except Exception:
+                pass
+            if dedup:
+                # prefer persisted last_serial if available; else last value
+                last = (self.profile.get("data_source", {}) or {}).get("last_serial")
+                pick = last if (last in dedup) else dedup[-1]
+                self.serial_pick_var.set(pick)
+                self.profile.setdefault("data_source", {})["last_serial"] = pick
+                try:
+                    save_profile(self.profile)
+                except Exception:
+                    pass
+                self._select_row_by_serial()
+        except Exception:
+            pass
+
+    def _select_row_by_serial(self):
+        if self.df is None or not self.serial_col_var.get() or not self.serial_pick_var.get():
+            return
+        serial = self.serial_pick_var.get().strip()
+        col = self.serial_col_var.get()
+        dff = self.df[self.df[col].astype(str).str.strip() == serial]
+        if len(dff) == 0:
+            self.current_row_index = None
+            self._set_status("Serial not found in current sheet.")
+            return
+        self.current_row_index = dff.index[-1]
+        self.profile.setdefault("data_source", {})["serial_col"] = col
+        save_profile(self.profile)
+        self._set_status(f"Selected row index: {self.current_row_index}")
+
+    # ========== Profile tab ==========
+    def _build_tab_profiles(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="Profile")
+
+        # Header (fixed, non-scrolling)
+        self._make_profile_header(tab)
+
+        f = ttk.Frame(tab); f.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(f, text="Profile:").grid(row=0, column=0, sticky="w")
+        self.profile_pick_var = tk.StringVar()
+        self.profile_pick_menu = ttk.Combobox(f, textvariable=self.profile_pick_var, width=40, state="readonly")
+        self.profile_pick_menu.grid(row=0, column=1, sticky="we", padx=(6, 6))
+        self.profile_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._load_selected_profile())
+
+        ttk.Button(f, text="New", command=self._new_profile).grid(row=0, column=2, padx=(4, 0))
+
+        ttk.Label(f, text="Name:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.profile_name_var = tk.StringVar(value=self.profile.get("profile_name"))
+        ttk.Entry(f, textvariable=self.profile_name_var, width=40).grid(row=1, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
+
+        ttk.Button(f, text="Save", command=self.on_save_profile).grid(row=1, column=2, pady=(8, 0))
+        ttk.Button(f, text="Save As...", command=self.on_save_as_profile).grid(row=1, column=3, pady=(8, 0))
+        ttk.Button(f, text="Delete", command=self.on_delete_profile).grid(row=1, column=4, pady=(8, 0))
+
+        # Profile tab Serial (row) picker (mirrors Data Source tab)
+        ttk.Label(f, text="Serial (row):").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.profile_serial_pick_var = tk.StringVar()
+        self.profile_serial_pick_menu = ttk.Combobox(f, textvariable=self.profile_serial_pick_var, width=40, state="readonly")
+        self.profile_serial_pick_menu.grid(row=2, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
+        self.profile_serial_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._on_profile_tab_serial_selected())
+
+        f.columnconfigure(1, weight=1)
+
+        # -- Template & Layout --
+        tf = ttk.LabelFrame(tab, text="Template & Layout")
+        tf.pack(fill="x", padx=10, pady=(6, 10))
+
+        self.include_graph_var = tk.BooleanVar(value=bool(self.profile.get("template", {}).get("include_graph", False)))
+        ttk.Checkbutton(tf, text="Include graph", variable=self.include_graph_var).grid(row=0, column=0, sticky="w", padx=4, pady=4)
+
+        ttk.Label(tf, text="Graph scale:").grid(row=0, column=1, sticky="e")
+        self.graph_scale_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_scale", 1.0)))
+        ttk.Entry(tf, textvariable=self.graph_scale_var, width=6).grid(row=0, column=2, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Graph X:").grid(row=0, column=3, sticky="e")
+        self.graph_x_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_x", 0.0)))
+        ttk.Entry(tf, textvariable=self.graph_x_var, width=6).grid(row=0, column=4, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Graph Y:").grid(row=0, column=5, sticky="e")
+        self.graph_y_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_y", 0.0)))
+        ttk.Entry(tf, textvariable=self.graph_y_var, width=6).grid(row=0, column=6, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Title color (hex):").grid(row=1, column=0, sticky="w")
+        self.title_color_var = tk.StringVar(value=self.profile.get("title_color", DEFAULT_TITLE_COLOR))
+        ttk.Entry(tf, textvariable=self.title_color_var, width=12).grid(row=1, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Text scale %:").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.text_scale_var = tk.IntVar(value=int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
+        ttk.Spinbox(tf, from_=60, to=160, increment=1, textvariable=self.text_scale_var, width=6, justify="right").grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(tf, text="Margins %:").grid(row=1, column=4, sticky="w", pady=(8, 0))
+        self.margin_var = tk.IntVar(value=int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
+        ttk.Spinbox(tf, from_=3, to=15, increment=1, textvariable=self.margin_var, width=6, justify="right").grid(row=1, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(tf, text="Label W (in):").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.win_var = tk.StringVar(value=str(self.profile.get("label_w_in", 3.0)))
+        ttk.Entry(tf, textvariable=self.win_var, width=6).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(tf, text="H:").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        self.hin_var = tk.StringVar(value=str(self.profile.get("label_h_in", 4.0)))
+        ttk.Entry(tf, textvariable=self.hin_var, width=6).grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(tf, text="Plot width % (graph):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.plotw_var = tk.IntVar(value=int(self.profile.get("plot_width_pct", DEFAULT_PLOT_WIDTH_PCT)))
+        self.plotw_spin = ttk.Spinbox(tf, from_=30, to=80, increment=1, textvariable=self.plotw_var, width=6, justify="right")
+        self.plotw_spin.grid(row=3, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(tf, text="Template text:").grid(row=4, column=0, sticky="nw", padx=4, pady=(8,3))
+        self.template_text = tk.Text(tf, width=76, height=6)
+        self.template_text.grid(row=4, column=1, columnspan=6, padx=4, pady=(8,3))
+        self.template_text.insert("1.0", self.profile.get("template", {}).get("template_text", ""))
+
+        # Output (inside Profile tab)
+        of = ttk.LabelFrame(tab, text="Output")
+        of.pack(fill="x", padx=10, pady=(6, 10))
+
+        ttk.Label(of, text="Output target:").grid(row=0, column=0, sticky="w")
+        self.target_var = tk.StringVar(value=self.profile.get("output_target", TARGET_LX900_3x4))
+        target_menu = ttk.Combobox(of, textvariable=self.target_var,
+                                values=[TARGET_LETTER_TWO_UP, TARGET_LX900_3x4],
+                                width=24, state="readonly")
+        target_menu.grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(of, text="Filename pattern:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.fnp_var = tk.StringVar(value=self.profile.get("filename_pattern", "{serial}_{profile}.pdf"))
+        ttk.Entry(of, textvariable=self.fnp_var, width=48).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(of, text="Copies:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.copies_var = tk.IntVar(value=int(self.profile.get("copies", 1)))
+        ttk.Spinbox(of, from_=1, to=50, increment=1, textvariable=self.copies_var, width=6, justify="right").grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        self.open_after_var = tk.BooleanVar(value=bool(self.profile.get("open_after", True)))
+        ttk.Checkbutton(of, text="Open after export", variable=self.open_after_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
+
+        ttk.Label(of, text="Output folder:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(of, textvariable=self.outdir_var, width=54).grid(row=4, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Button(of, text="Browse...", command=self._browse_outdir).grid(row=4, column=2, sticky="w", pady=(8, 0))
+
+        # Traces and initial sync
+        self._attach_profile_traces()
+        self._sync_profile_to_ui()
+        self._toggle_binding_panels()
+        self._update_graph_controls_visibility()
+
+    # ========== Bindings tab ==========
+    def _build_tab_bindings(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="Bindings")
+
+        # Header (fixed, non-scrolling)
+        self._make_profile_header(tab)
+
+        sf = ScrollableFrame(tab)
+        sf.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Action row (removed the small "Bindings:" label)
+        action_row = ttk.Frame(sf.scrollable_frame)
+        action_row.pack(fill="x", padx=10, pady=(4, 2))
+        ttk.Button(action_row, text="Save Bindings", command=self.on_save_bindings).pack(side="right")
+        ttk.Label(action_row, text="(Pick flow columns and slot columns, then Save Bindings)").pack(side="right", padx=(0, 8))
+
+        # Graph bindings
+        self.bind_graph = ttk.LabelFrame(sf.scrollable_frame, text="Graph Bindings")
+        self.bind_graph.pack(fill="x", padx=10, pady=6)
+
+        self.bg_title_var = tk.StringVar(value=self.profile.get("bindings", {}).get("title", "Neb Label"))
+        self.bg_inc_trend_var = tk.BooleanVar(value=bool(self.profile.get("bindings", {}).get("include_trendline", True)))
+        ttk.Label(self.bind_graph, text="Title:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.bind_graph, textvariable=self.bg_title_var, width=36).grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Checkbutton(self.bind_graph, text="Include trendline", variable=self.bg_inc_trend_var).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(self.bind_graph, text="Flow columns (X):").grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        # Create the listbox with persistent highlight
+        self.list_cols = tk.Listbox(self.bind_graph, selectmode="multiple", width=48, height=12, exportselection=False)
+        try:
+            self.list_cols.configure(selectbackground="#0E6CD6", selectforeground="white")
+        except Exception:
+            pass
+        self.list_cols.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(8, 0))
+
+        # Right-side selected text panel (top-to-bottom)
+        sel_panel = ttk.Frame(self.bind_graph)
+        sel_panel.grid(row=1, column=4, sticky="nw", padx=(12, 0), pady=(8, 0))
+        ttk.Label(sel_panel, text="Selected (top to bottom):").pack(anchor="w")
+        self.selected_cols_text = tk.Text(sel_panel, width=28, height=12, wrap="none")
+        self.selected_cols_text.configure(state="disabled")
+        self.selected_cols_text.pack(fill="both", expand=False, pady=(4, 0))
+
+        # Update profile on change and refresh the right-side text panel
+        self.list_cols.bind("<<ListboxSelect>>", lambda e: (self._on_profile_field_change(), self._render_selected_cols_view()))
+
+        # Graph: Value slots (optional)
+        ttk.Label(self.bind_graph, text="Value Slots (optional):").grid(row=3, column=0, sticky="w", pady=(10, 2))
+        self.g_slot_label_vars: List[tk.StringVar] = []
+        self.g_slot_col_vars: List[tk.StringVar] = []
+        self.g_slot_col_cbs.clear()
+        row = 4
+        for i in range(1, 7):
+            labv = tk.StringVar()
+            colv = tk.StringVar()
+            self.g_slot_label_vars.append(labv)
+            self.g_slot_col_vars.append(colv)
+            ttk.Label(self.bind_graph, text=f"Label {i}:").grid(row=row, column=0, sticky="w")
+            ent = ttk.Entry(self.bind_graph, textvariable=labv, width=24)
+            ent.grid(row=row, column=1, sticky="w", padx=(6, 12))
+            ent.bind("<FocusOut>", lambda e: self._on_profile_field_change())
+            ttk.Label(self.bind_graph, text=f"Value {i} column:").grid(row=row, column=2, sticky="w")
+            cb = ttk.Combobox(self.bind_graph, textvariable=colv, width=24, state="readonly")
+            cb.grid(row=row, column=3, sticky="w", padx=(6, 12))
+            cb.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_profile_field_change())
+            self.g_slot_col_cbs.append(cb)
+            row += 1
+
+        # Value bindings (non-graph)
+        self.bind_values = ttk.LabelFrame(sf.scrollable_frame, text="Value Bindings")
+        self.bv_title_var = tk.StringVar()
+        self.bv_subtitle_var = tk.StringVar()
+        self.bv_logo_var = tk.StringVar()
+
+        row = 0
+        ttk.Label(self.bind_values, text="Title:").grid(row=row, column=0, sticky="w"); row += 1
+        e = ttk.Entry(self.bind_values, textvariable=self.bv_title_var, width=36)
+        e.grid(row=row-1, column=1, sticky="w", padx=(6, 12))
+        e.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
+
+        ttk.Label(self.bind_values, text="Subtitle:").grid(row=row, column=0, sticky="w"); row += 1
+        e2 = ttk.Entry(self.bind_values, textvariable=self.bv_subtitle_var, width=36)
+        e2.grid(row=row-1, column=1, sticky="w", padx=(6, 12))
+        e2.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
+
+        ttk.Label(self.bind_values, text="Logo path:").grid(row=row, column=0, sticky="w"); row += 1
+        le = ttk.Entry(self.bind_values, textvariable=self.bv_logo_var, width=48)
+        le.grid(row=row-1, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(self.bind_values, text="Browse...", command=self._browse_logo).grid(row=row-1, column=2, sticky="w")
+        le.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
+
+        self.slot_label_vars: List[tk.StringVar] = []
+        self.slot_col_vars: List[tk.StringVar] = []
+        self.slot_col_cbs.clear()
+        for i in range(1, 7):
+            labv = tk.StringVar()
+            colv = tk.StringVar()
+            self.slot_label_vars.append(labv)
+            self.slot_col_vars.append(colv)
+            ttk.Label(self.bind_values, text=f"Label {i}:").grid(row=row, column=0, sticky="w")
+            ent = ttk.Entry(self.bind_values, textvariable=labv, width=24)
+            ent.grid(row=row, column=1, sticky="w", padx=(6, 12))
+            ent.bind("<FocusOut>", lambda e: self._on_profile_field_change())
+            ttk.Label(self.bind_values, text=f"Value {i} column:").grid(row=row, column=2, sticky="w")
+            cb = ttk.Combobox(self.bind_values, textvariable=colv, width=24, state="readonly")
+            cb.grid(row=row, column=3, sticky="w", padx=(6, 12))
+            cb.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_profile_field_change())
+            self.slot_col_cbs.append(cb)
+            row += 1
+
+        self._toggle_binding_panels()
+        self._refresh_binding_columns()
+        # Ensure right-side selected list renders immediately
+        try:
+            self._render_selected_cols_view()
+        except Exception:
+            pass
+
+    def on_save_bindings(self):
+        """
+        Save the current bindings (flow columns, slot labels/columns) to the active profile file.
+        Shows a short confirmation and keeps the 'Selected:' summary up to date.
+        """
+        try:
+            # Ensure the latest UI selections are written into the profile dict
+            self._on_profile_field_change(force_save=True)
+
+            # Persist to disk
+            save_profile(self.profile)
+
+            # Refresh the visible summary under the listbox (safe if helper exists)
+            try:
+                if hasattr(self, "_update_selected_cols_label"):
+                    self._update_selected_cols_label()
+            except Exception:
+                pass
+
+            # Brief confirmation for the user
+            try:
+                self._flash_message("Bindings saved", 1500)
+            except Exception:
+                self._set_status("Bindings saved")
+        except Exception as e:
+            try:
+                messagebox.showerror("Save Bindings", f"Failed to save bindings: {e}")
+            except Exception:
+                pass
+
+
+    # ========== Actions tab ==========
+    def _build_tab_actions(self):
+        tab = ttk.Frame(self.nb)
+        self.nb.add(tab, text="Preview & Generate")
+
+        # Header (fixed)
+        self._make_profile_header(tab)
+
+        f = ttk.Frame(tab); f.pack(fill="x", padx=10, pady=10)
+        ttk.Button(f, text="Preview (current row)", command=self.on_preview).pack(side="left")
+        ttk.Button(f, text="Generate PDF (current row)", command=self.on_generate).pack(side="left", padx=(10, 0))
+
+    # ========== Debug helper ==========
+    def _debug_print_profile_and_row(self, profile, df, row):
+        try:
+            import json, pprint
+            print("---- DEBUG PROFILE ----")
+            try:
+                print(json.dumps(profile, indent=2, default=str)[:4000])
+            except Exception:
+                pprint.pprint(profile)
+            print("---- DEBUG DF HEAD ----")
+            try:
+                print(df.head().to_string() if df is not None else "<df is None>")
+            except Exception:
+                print("<failed to print df head>")
+            print("---- DEBUG ROW ----")
+            try:
+                print(row.to_dict() if row is not None else "<row is None>")
+            except Exception:
+                print("<failed to print row>")
+            print("------------------------")
+        except Exception:
+            pass
+
+    def _on_profile_tab_serial_selected(self):
+        """
+        Called when the serial is chosen from the Profile tab's Serial (row) combobox.
+        Keeps the Data tab's serial selection in sync, selects the row, and persists last_serial.
+        """
+        try:
+            s = (self.profile_serial_pick_var.get() or "").strip()
+            if not s:
+                return
+            # mirror into Data Source tab serial picker if present
+            if hasattr(self, "serial_pick_var") and self.serial_pick_var is not None:
+                try:
+                    self.serial_pick_var.set(s)
+                except Exception:
+                    pass
+            # select row if possible (uses serial_pick_var and serial_col_var)
+            try:
+                self._select_row_by_serial()
+            except Exception:
+                pass
+            # persist into profile
+            self.profile.setdefault("data_source", {})["last_serial"] = s
+            try:
+                save_profile(self.profile)
+            except Exception:
+                pass
+            self._set_status(f"Serial selected: {s}")
+        except Exception:
+            pass
+
+    def _update_profile_serial_menu_values(self, serial_list: List[str]):
+        """
+        Update the Serial (row) combobox on the Profile tab with the provided values and select an appropriate default.
+        """
+        try:
+            if not hasattr(self, "profile_serial_pick_menu") or self.profile_serial_pick_menu is None:
+                return
+            self.profile_serial_pick_menu["values"] = serial_list or []
+            last = (self.profile.get("data_source", {}) or {}).get("last_serial")
+            if last and last in (serial_list or []):
+                self.profile_serial_pick_var.set(last)
+            elif serial_list:
+                # choose last available by default if nothing saved
+                self.profile_serial_pick_var.set(serial_list[-1])
+        except Exception:
+            pass
+
+    # ========== Profile/UI sync and autosave ==========
+    def _attach_profile_traces(self):
+        def _safe_add_trace(var, cb):
+            try:
+                if var is not None:
+                    var.trace_add("write", cb)
+            except Exception:
+                pass
+
+        _safe_add_trace(getattr(self, "profile_pick_var", None), lambda *a: None)
+        # Update header immediately and autosave on name change
+        _safe_add_trace(
+            getattr(self, "profile_name_var", None),
+            lambda *a: (self._update_profile_header(), self._schedule_autosave())
+        )
+
+        # Data-source fields
+        _safe_add_trace(getattr(self, "xlsx_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "sheet_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "serial_col_var", None), lambda *a: self._schedule_autosave())
+
+        # Template/layout
+        _safe_add_trace(getattr(self, "title_color_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "text_scale_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "margin_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "win_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "hin_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "plotw_var", None), lambda *a: self._schedule_autosave())
+
+        # Output
+        _safe_add_trace(getattr(self, "target_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "fnp_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "copies_var", None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "open_after_var", None), lambda *a: self._schedule_autosave())
+
+        # Include graph toggling
+        def _include_graph_cb(*_):
+            try:
+                self._toggle_binding_panels()
+            except Exception:
+                pass
+            self._schedule_autosave()
+        _safe_add_trace(getattr(self, "include_graph_var", None), _include_graph_cb)
+
+        # Template text saves on focus-out
+        try:
+            if hasattr(self, "template_text") and getattr(self, "template_text") is not None:
+                self.template_text.bind("<FocusOut>", lambda e: self._schedule_autosave())
+        except Exception:
+            pass
+
+    def _update_selected_cols_label(self):
+        """
+        Update the 'Selected:' summary under the Flow columns listbox so the user
+        always sees which columns are selected (even if the listbox isn't focused).
+        """
+        try:
+            if not hasattr(self, "selected_cols_var"):
+                return
+            if hasattr(self, "list_cols") and self.list_cols is not None:
+                sel = [self.list_cols.get(i) for i in self.list_cols.curselection()]
+                self.selected_cols_var.set("Selected: " + (", ".join(sel) if sel else "(none)"))
+        except Exception:
+            # never raise from UI helper
+            pass
+
+
+    def _schedule_autosave(self, delay_ms: int = 400):
+        # Debounce frequent edits
+        try:
+            if self._autosave_after_id:
+                self.after_cancel(self._autosave_after_id)
+        except Exception:
+            pass
+        self._autosave_after_id = self.after(delay_ms, lambda: self._on_profile_field_change())
+
+    def _on_profile_field_change(self, force_save: bool = False):
+        if not getattr(self, "profile", None):
+            return
+
+        # Profile name
+        try:
+            if getattr(self, "profile_name_var", None):
+                self.profile["profile_name"] = self.profile_name_var.get().strip() or self.profile.get("profile_name")
+        except Exception:
+            pass
+
+        # Template & layout
+        self.profile.setdefault("template", {})
+        try:
+            self.profile["template"]["include_graph"] = bool(self.include_graph_var.get())
+        except Exception:
+            pass
+        try:
+            self.profile["template"]["graph_scale"] = float(self.graph_scale_var.get())
+            self.profile["template"]["graph_x"] = float(self.graph_x_var.get())
+            self.profile["template"]["graph_y"] = float(self.graph_y_var.get())
+        except Exception:
+            pass
+        try:
+            if getattr(self, "template_text", None):
+                self.profile["template"]["template_text"] = self.template_text.get("1.0", "end").rstrip("\n")
+        except Exception:
+            pass
+
+        try:
+            self.profile["title_color"] = self.title_color_var.get().strip() or DEFAULT_TITLE_COLOR
+            self.profile["text_scale_pct"] = int(self.text_scale_var.get())
+            self.profile["margin_pct"] = int(self.margin_var.get())
+            self.profile["label_w_in"] = float(self.win_var.get())
+            self.profile["label_h_in"] = float(self.hin_var.get())
+            self.profile["plot_width_pct"] = int(self.plotw_var.get())
+        except Exception:
+            pass
+
+        # Output
+        try:
+            self.profile["output_target"] = self.target_var.get()
+            self.profile["filename_pattern"] = self.fnp_var.get().strip() or "{serial}_{profile}.pdf"
+            self.profile["copies"] = int(self.copies_var.get())
+            self.profile["open_after"] = bool(self.open_after_var.get())
+        except Exception:
+            pass
+
+        # Bindings
+        b = self.profile.setdefault("bindings", {})
+        include_graph = bool(self.profile.get("template", {}).get("include_graph", False))
+
+        if include_graph:
+            # Graph bindings
+            try:
+                b["title"] = self.bg_title_var.get().strip() or "Neb Label"
+                b["include_trendline"] = bool(self.bg_inc_trend_var.get())
+            except Exception:
+                pass
+            # Flow columns: read directly from listbox items
+            try:
+                if getattr(self, "list_cols", None):
+                    sel_idx = self.list_cols.curselection()
+                    b["x_flow_columns"] = [self.list_cols.get(i) for i in sel_idx]
+            except Exception:
+                pass
+            # Slot labels/columns
+            for i in range(1, 7):
+                try:
+                    lbl = self.g_slot_label_vars[i-1].get() if i-1 < len(self.g_slot_label_vars) else ""
+                    col = self.g_slot_col_vars[i-1].get() if i-1 < len(self.g_slot_col_vars) else ""
+                    b[f"slot{i}_label"] = (lbl or "").strip()
+                    b[f"slot{i}_col"] = (col or "").strip()
+                except Exception:
+                    pass
+        else:
+            # Value bindings
+            try:
+                b["title"] = self.bv_title_var.get().strip() or "Neb Label"
+                b["subtitle"] = self.bv_subtitle_var.get().strip()
+                b["logo_path"] = self.bv_logo_var.get().strip()
+            except Exception:
+                pass
+            for i in range(1, 7):
+                try:
+                    lbl = self.slot_label_vars[i-1].get() if i-1 < len(self.slot_label_vars) else ""
+                    col = self.slot_col_vars[i-1].get() if i-1 < len(self.slot_col_vars) else ""
+                    b[f"slot{i}_label"] = (lbl or "").strip()
+                    b[f"slot{i}_col"] = (col or "").strip()
+                except Exception:
+                    pass
+
+        # Data-source metadata (best effort)
+        ds = self.profile.setdefault("data_source", {})
+        try:
+            if getattr(self, "xlsx_var", None) and self.xlsx_var.get():
+                ds["xlsx_path"] = self.xlsx_var.get()
+            if getattr(self, "sheet_var", None) and self.sheet_var.get():
+                ds["sheet"] = self.sheet_var.get()
+            if getattr(self, "serial_col_var", None) and self.serial_col_var.get():
+                ds["serial_col"] = self.serial_col_var.get()
+        except Exception:
+            pass
+
+        # Save
+        try:
+            save_profile(self.profile)
+        except Exception:
+            pass
+
+    def _refresh_binding_columns(self):
+        """
+        Rebuild binding choices from self.df and re-apply saved selections.
+
+        - Populates the Flow columns (X) listbox with current df columns.
+        - Re-applies saved selections from profile['bindings']['x_flow_columns'].
+        - Keeps selection highlight visible (exportselection=False assumed in builder).
+        - Updates the right-side selected text panel via _render_selected_cols_view().
+        - Populates slot column comboboxes (graph and non-graph) with df columns
+        and re-applies saved selections that still exist.
+        - Defensive: safe if widgets or df are not yet available.
+        """
+        # 1) Collect column names from the loaded DataFrame
+        try:
+            cols = list(self.df.columns) if getattr(self, "df", None) is not None else []
+        except Exception:
+            cols = []
+
+        # 2) Load saved bindings (defensive)
+        try:
+            b = self.profile.get("bindings", {}) if getattr(self, "profile", None) else {}
+        except Exception:
+            b = {}
+        try:
+            include_graph = bool(self.profile.get("template", {}).get("include_graph", False))
+        except Exception:
+            include_graph = False
+
+        # 3) Flow columns listbox (Graph mode)
+        try:
+            if hasattr(self, "list_cols") and self.list_cols is not None:
+                # Refresh entries
+                try:
+                    self.list_cols.delete(0, tk.END)
+                    for c in cols:
+                        self.list_cols.insert(tk.END, c)
+                except Exception:
+                    pass
+
+                # Re-apply saved selections (accept list or '|' separated string)
+                saved = b.get("x_flow_columns", []) or []
+                if isinstance(saved, str):
+                    saved = [s.strip() for s in saved.split("|") if s.strip()]
+                try:
+                    self.list_cols.selection_clear(0, tk.END)
+                except Exception:
+                    pass
+
+                try:
+                    # Map saved names to current indices; ignore names not in current df
+                    name_to_idx = {name: i for i, name in enumerate(cols)}
+                    for name in saved:
+                        idx = name_to_idx.get(name)
+                        if idx is not None:
+                            try:
+                                self.list_cols.selection_set(idx)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 4) Graph slot combobox options and selections
+        try:
+            for cb in getattr(self, "g_slot_col_cbs", []) or []:
+                try:
+                    cb["values"] = cols
+                except Exception:
+                    pass
+
+            for i in range(1, 7):
+                key = f"slot{i}_col"
+                val = b.get(key, "") or ""
+                try:
+                    # Prefer updating the StringVar if present (keeps combobox in sync)
+                    if i - 1 < len(getattr(self, "g_slot_col_vars", [])):
+                        self.g_slot_col_vars[i - 1].set(val if val in cols else "")
+                    elif i - 1 < len(getattr(self, "g_slot_col_cbs", [])):
+                        self.g_slot_col_cbs[i - 1].set(val if val in cols else "")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 5) Non-graph (Value) slot combobox options and selections
+        try:
+            for cb in getattr(self, "slot_col_cbs", []) or []:
+                try:
+                    cb["values"] = cols
+                except Exception:
+                    pass
+
+            for i in range(1, 7):
+                key = f"slot{i}_col"
+                val = b.get(key, "") or ""
+                try:
+                    if i - 1 < len(getattr(self, "slot_col_vars", [])):
+                        self.slot_col_vars[i - 1].set(val if val in cols else "")
+                    elif i - 1 < len(getattr(self, "slot_col_cbs", [])):
+                        self.slot_col_cbs[i - 1].set(val if val in cols else "")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 6) Update the right-side selected view to match current listbox selection
+        try:
+            if hasattr(self, "_render_selected_cols_view"):
+                self._render_selected_cols_view()
+        except Exception:
+            pass
+
+        # 7) Reflect graph/value mode enable/disable states (if helper exists)
+        try:
+            if hasattr(self, "_update_graph_controls_visibility"):
+                self._update_graph_controls_visibility()
+        except Exception:
+            pass
+
+    def _browse_logo(self):
+        try:
+            path = filedialog.askopenfilename(
+                title="Select Logo image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")]
+            )
+            if not path:
+                return
+            if not getattr(self, "bv_logo_var", None):
+                self.bv_logo_var = tk.StringVar()
+            self.bv_logo_var.set(path)
+            self._on_profile_field_change()
+            self._set_status(f"Logo selected: {path}")
+        except Exception as e:
+            try:
+                messagebox.showerror("Error", f"Failed to select logo: {e}")
+            except Exception:
+                pass
+
+    def _toggle_binding_panels(self):
+        try:
+            graph_mode = bool(self.include_graph_var.get())
+        except Exception:
+            graph_mode = False
+
+        if graph_mode:
+            if hasattr(self, "bind_values"):
+                try: self.bind_values.pack_forget()
+                except Exception: pass
+            if hasattr(self, "bind_graph"):
+                try: self.bind_graph.pack(fill="x", padx=10, pady=10)
+                except Exception: pass
+        else:
+            if hasattr(self, "bind_graph"):
+                try: self.bind_graph.pack_forget()
+                except Exception: pass
+            if hasattr(self, "bind_values"):
+                try: self.bind_values.pack(fill="x", padx=10, pady=10)
+                except Exception: pass
+
+    def _sync_profile_to_ui(self):
+        if getattr(self, "profile_name_var", None):
+            self.profile_name_var.set(self.profile.get("profile_name", self.profile_name_var.get()))
+
+        # Data source
+        ds = self.profile.get("data_source", {}) or {}
+        if getattr(self, "xlsx_var", None):
+            if ds.get("xlsx_path"):
+                try:
+                    self.xlsx_var.set(ds.get("xlsx_path"))
+                    self.xlsx_path = ds.get("xlsx_path")
+                except Exception:
+                    pass
+            if getattr(self, "sheet_menu", None):
+                try:
+                    sheets = read_excel_sheet_names(ds.get("xlsx_path")) if ds.get("xlsx_path") else []
+                    self.sheet_menu["values"] = sheets
+                    if ds.get("sheet") and ds.get("sheet") in sheets:
+                        self.sheet_var.set(ds.get("sheet"))
+                        try: self._load_sheet()
+                        except Exception: pass
+                except Exception:
+                    pass
+            if getattr(self, "serial_col_var", None):
+                try:
+                    self.serial_col_var.set(ds.get("serial_col", self.serial_col_var.get()))
+                except Exception:
+                    pass
+
+            # Profile tab Serial (row) selector from persisted last_serial
+            try:
+                if hasattr(self, "profile_serial_pick_var", None):
+                    last = ds.get("last_serial")
+                    if last:
+                        self.profile_serial_pick_var.set(last)
+            except Exception:
+                pass
+
+        # Template & layout
+        tpl = self.profile.get("template", {})
+        try: self.include_graph_var.set(bool(tpl.get("include_graph", False)))
+        except Exception: pass
+        try: self.graph_scale_var.set(float(tpl.get("graph_scale", 1.0)))
+        except Exception: pass
+        try: self.graph_x_var.set(float(tpl.get("graph_x", 0.0)))
+        except Exception: pass
+        try: self.graph_y_var.set(float(tpl.get("graph_y", 0.0)))
+        except Exception: pass
+
+        if getattr(self, "template_text", None):
+            try:
+                self.template_text.delete("1.0", "end")
+                self.template_text.insert("1.0", tpl.get("template_text", ""))
+            except Exception:
+                pass
+
+        try: self.title_color_var.set(self.profile.get("title_color", DEFAULT_TITLE_COLOR))
+        except Exception: pass
+        try: self.text_scale_var.set(int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
+        except Exception: pass
+        try: self.margin_var.set(int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
+        except Exception: pass
+        try: self.win_var.set(str(self.profile.get("label_w_in", 3.0)))
+        except Exception: pass
+        try: self.hin_var.set(str(self.profile.get("label_h_in", 4.0)))
+        except Exception: pass
+        try: self.plotw_var.set(int(self.profile.get("plot_width_pct", DEFAULT_PLOT_WIDTH_PCT)))
+        except Exception: pass
+
+        # Output
+        try: self.target_var.set(self.profile.get("output_target", TARGET_LX900_3x4))
+        except Exception: pass
+        try: self.fnp_var.set(self.profile.get("filename_pattern", "{serial}_{profile}.pdf"))
+        except Exception: pass
+        try: self.copies_var.set(int(self.profile.get("copies", 1)))
+        except Exception: pass
+        try: self.open_after_var.set(bool(self.profile.get("open_after", True)))
+        except Exception: pass
+        try:
+            if not self.outdir_var.get():
+                self.outdir_var.set(str(Path.cwd()))
+        except Exception:
+            pass
+
+        # Bindings
+        b = self.profile.get("bindings", {})
+        include_graph = bool(tpl.get("include_graph", False))
+        try:
+            include_graph = bool(self.include_graph_var.get())
+        except Exception:
+            pass
+
+        if include_graph:
+            try: self.bg_title_var.set(b.get("title", "Neb Label"))
+            except Exception: pass
+            try: self.bg_inc_trend_var.set(bool(b.get("include_trendline", True)))
+            except Exception: pass
+            for i in range(1, 7):
+                try:
+                    self.g_slot_label_vars[i-1].set(b.get(f"slot{i}_label", ""))
+                    self.g_slot_col_vars[i-1].set(b.get(f"slot{i}_col", ""))
+                except Exception:
+                    pass
+        else:
+            try: self.bv_title_var.set(b.get("title", "Neb Label"))
+            except Exception: pass
+            try: self.bv_subtitle_var.set(b.get("subtitle", ""))
+            except Exception: pass
+            try: self.bv_logo_var.set(b.get("logo_path", ""))
+            except Exception: pass
+            for i in range(1, 7):
+                try:
+                    self.slot_label_vars[i-1].set(b.get(f"slot{i}_label", ""))
+                    self.slot_col_vars[i-1].set(b.get(f"slot{i}_col", ""))
+                except Exception:
+                    pass
+
+        try: self._refresh_binding_columns()
+        except Exception: pass
+        try: self._toggle_binding_panels()
+        except Exception: pass
+        try: self._update_graph_controls_visibility()
+        except Exception: pass
+
+        # Update profile headers on every sync
+        try:
+            self._update_profile_header()
+        except Exception:
+            pass
+
+    def _sync_ui_to_profile(self):
+        self._on_profile_field_change()
+
+    def _update_graph_controls_visibility(self):
+        try:
+            graph_mode = bool(self.include_graph_var.get())
+        except Exception:
+            graph_mode = False
+
+        try:
+            self.plotw_spin.configure(state="normal" if graph_mode else "disabled")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "list_cols") and self.list_cols is not None:
+                self.list_cols.configure(state="normal" if graph_mode else "disabled")
+        except Exception:
+            pass
+        for cb in getattr(self, "g_slot_col_cbs", []):
+            try: cb.configure(state="readonly" if graph_mode else "disabled")
+            except Exception: pass
+        for cb in getattr(self, "slot_col_cbs", []):
+            try: cb.configure(state="readonly" if not graph_mode else "disabled")
+            except Exception: pass
+
+    # ========== Actions & rendering ==========
+    def _get_selected_row(self) -> Optional[pd.Series]:
+        if self.df is None or self.current_row_index is None:
+            return None
+        try:
+            return self.df.loc[self.current_row_index]
+        except Exception:
+            return None
+
+    def _get_output_dir(self) -> Path:
+        try:
+            val = self.outdir_var.get().strip() if hasattr(self, "outdir_var") and self.outdir_var is not None else ""
+            return Path(val) if val else Path.cwd()
+        except Exception:
+            return Path.cwd()
+
+    def on_preview(self):
+        row = self._get_selected_row()
+        if row is None:
+            messagebox.showerror("Preview", "Select a data row first.")
+            return
+        try: self._sync_ui_to_profile()
+        except Exception: pass
+
+        out_dir = self._get_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_pdf = out_dir / "_preview_label.pdf"
+
+        try:
+            render_profile_to_pdf(self.profile, self.df, row, tmp_pdf)
+            if not tmp_pdf.exists() or tmp_pdf.stat().st_size == 0:
+                messagebox.showerror("Preview failed", f"Output file missing or empty: {tmp_pdf}")
+                self._set_status("Preview failed: output missing")
+                return
+            self.last_pdf = tmp_pdf
+            try: self._open_file(tmp_pdf)
+            except Exception: pass
+            self._set_status(f"Preview generated: {tmp_pdf}")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            try: messagebox.showerror("Preview failed", f"{e}\n\n{tb}")
+            except Exception:
+                print("Preview failed:", e); print(tb)
+            self._set_status("Preview failed: see console")
+
+    def on_generate(self):
+        row = self._get_selected_row()
+        if row is None:
+            messagebox.showerror("Generate", "Select a data row first.")
+            return
+        try: self._sync_ui_to_profile()
+        except Exception: pass
+
+        serial_col = self.serial_col_var.get() if hasattr(self, "serial_col_var") else ""
+        serial_val = str(row.get(serial_col, "")).strip() if serial_col else ""
+        filename = self.profile.get("filename_pattern", "{serial}_{profile}.pdf")
+        filename = filename.replace("{serial}", serial_val or "row")
+        filename = filename.replace("{profile}", self.profile.get("profile_name", "Profile"))
+
+        out_dir = self._get_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_pdf = out_dir / filename
+
+        try:
+            render_profile_to_pdf(self.profile, self.df, row, out_pdf)
+            if not out_pdf.exists() or out_pdf.stat().st_size == 0:
+                messagebox.showerror("Generate failed", f"Output file missing or empty: {out_pdf}")
+                self._set_status("Generate failed: output missing")
+                return
+            self.last_pdf = out_pdf
+            open_after = False
+            try: open_after = bool(self.open_after_var.get())
+            except Exception: pass
+            if open_after:
+                try: self._open_file(out_pdf)
+                except Exception: pass
+            self._set_status(f"PDF generated: {out_pdf}")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            try: messagebox.showerror("Generate failed", f"{e}\n\n{tb}")
+            except Exception:
+                print("Generate failed:", e); print(tb)
+            self._set_status("Generate failed: see console")
+
+    def _open_file(self, path: Path):
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined>
+            elif sys.platform == "darwin":
+                os.system(f"open '{path}'")
+            else:
+                os.system(f"xdg-open '{path}'")
+        except Exception:
+            pass
+
+    # ========== Utilities: profile lifecycle ==========
+    def _refresh_profile_list(self):
+        names = list_profiles()
+        self.profile_pick_menu["values"] = names
+        if self.profile.get("profile_name") and self.profile.get("profile_name") in names:
+            self.profile_pick_var.set(self.profile.get("profile_name"))
+
+    def _load_selected_profile(self):
+        name = self.profile_pick_var.get().strip()
+        if not name:
+            return
+        try:
+            self.profile = load_profile(name)
+            if "template" not in self.profile:
+                self.profile["template"] = {}
+            self.profile_name_var.set(self.profile.get("profile_name", name))
+            self._sync_profile_to_ui()
+            self._set_status(f"Profile loaded: {name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load profile: {e}")
+
+    def _new_profile(self):
+        """
+        Create a fresh profile using the default template settings.
+        Keeps current Data Source selections (xlsx/sheet/serial) so you don't have to re-pick.
+        """
+        try:
+            # Start with a fresh profile model
+            new_prof = default_profile(TEMPLATE_GRAPH)
+
+            # Optionally carry over current output settings and filename pattern
+            try:
+                new_prof["output_target"] = self.profile.get("output_target", new_prof.get("output_target"))
+                new_prof["filename_pattern"] = self.profile.get("filename_pattern", new_prof.get("filename_pattern", "{serial}_{profile}.pdf"))
+                new_prof["copies"] = self.profile.get("copies", new_prof.get("copies", 1))
+                new_prof["open_after"] = self.profile.get("open_after", new_prof.get("open_after", True))
+            except Exception:
+                pass
+
+            # Keep current Data Source selection (if present) to avoid re-picking
+            ds = {}
+            try:
+                if hasattr(self, "xlsx_var") and self.xlsx_var.get():
+                    ds["xlsx_path"] = self.xlsx_var.get()
+                if hasattr(self, "sheet_var") and self.sheet_var.get():
+                    ds["sheet"] = self.sheet_var.get()
+                if hasattr(self, "serial_col_var") and self.serial_col_var.get():
+                    ds["serial_col"] = self.serial_col_var.get()
+                if hasattr(self, "serial_pick_var") and self.serial_pick_var.get():
+                    ds["last_serial"] = self.serial_pick_var.get()
+            except Exception:
+                pass
+            if ds:
+                new_prof["data_source"] = ds
+
+            # Swap in and refresh UI
+            self.profile = new_prof
+            try:
+                self.profile_name_var.set(self.profile.get("profile_name", "Profile"))
+            except Exception:
+                pass
+
+            # Re-apply to UI
+            self._sync_profile_to_ui()
+            # Don’t save automatically; user can Save or Save As to name it
+            self._set_status(f"New profile created: {self.profile.get('profile_name', 'Profile')}")
+        except Exception as e:
+            messagebox.showerror("New Profile", f"Failed to create new profile: {e}")
+
+    def on_save_profile(self):
+        self._sync_ui_to_profile()
+        p = save_profile(self.profile)
+        self._refresh_profile_list()
+        self._set_status(f"Profile saved: {p}")
+
+    def on_save_as_profile(self):
+        self._sync_ui_to_profile()
+        name = self._prompt_text("Save Profile As", "Profile name:", default=self.profile.get("profile_name", "Profile"))
+        if not name:
+            return
+        self.profile["profile_name"] = name
+        p = save_profile(self.profile)
+        self._refresh_profile_list()
+        self.profile_pick_var.set(self.profile["profile_name"])
+        self._set_status(f"Profile saved as: {p}")
+
+    def on_delete_profile(self):
+        name = self.profile_pick_var.get().strip()
+        if not name:
+            messagebox.showinfo("Delete", "Select a profile to delete.")
+            return
+        if not messagebox.askyesno("Delete", f"Delete profile '{name}'?"):
+            return
+        try:
+            pp = PROFILE_DIR / f"{name}.json"
+            if pp.exists():
+                pp.unlink()
+            self._refresh_profile_list()
+            self._set_status(f"Deleted profile: {name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete: {e}")
+
+    def _browse_outdir(self):
         path = filedialog.askdirectory(title="Select output folder")
         if path:
             self.outdir_var.set(path)
+            self._schedule_autosave()
 
-    def on_generate(self):
-        if self.df is None:
-            messagebox.showerror("Missing data", "Load an Excel file and sheet first.")
-            return
-
-        title_text = self.title_var.get().strip() or DEFAULT_TITLE
-        title_color = _coerce_color_hex(self.title_color_var.get().strip(), DEFAULT_TITLE_COLOR)
-
+    def _flash_message(self, msg: str, ms: int = 1200):
         try:
-            label_w_in = float(self.win_var.get())
-            label_h_in = float(self.hin_var.get())
-            if label_w_in <= 0 or label_h_in <= 0:
-                raise ValueError
-        except Exception:
-            messagebox.showerror("Invalid size", "Label width/height must be positive numbers (inches).")
-            return
-
-        plot_width_pct = int(self.plotw_var.get())
-        text_scale_pct = int(self.text_scale_var.get())
-        margin_pct = int(self.margin_var.get())
-
-        # Ensure normalized serial string column exists
-        if "_SerialStr" not in self.df.columns:
-            serial_col = "Serial Number" if "Serial Number" in self.df.columns else _find_serial_column(list(self.df.columns))
-            if serial_col:
-                self.df["_SerialStr"] = self.df[serial_col].astype(str).str.strip()
-            else:
-                self.df["_SerialStr"] = self.df.index.astype(str)
-
-        # Pick row for serial using normalized string; fallback to last row
-        serial = self.serial_var.get().strip()
-        if serial and ("_SerialStr" in self.df.columns):
-            dff = self.df[self.df["_SerialStr"] == serial]
-            if len(dff) == 0:
-                messagebox.showerror("Not found", "Selected Serial Number not found.")
-                return
-            # If there is a likely datetime column, use latest; else last
-            date_col = None
-            for cand in ["Testing Date", "Test Date", "Date", "Timestamp", "Testing Data"]:
-                if cand in dff.columns:
-                    date_col = cand
-                    break
-            if date_col is not None:
-                try:
-                    dff = dff.sort_values(date_col)
-                except Exception:
-                    pass
-            sel_row = dff.iloc[-1]
-        else:
-            sel_row = self.df.iloc[-1]
-        serial_value = str(sel_row.get("_SerialStr", "")) or str(sel_row.get("Serial Number", ""))
-
-        # Backpressure / vacuum
-        bp_col = self.bp_col_var.get() or None
-        vc_col = self.vc_col_var.get() or None
-        bp_val = sel_row.get(bp_col) if bp_col else None
-        vc_val = sel_row.get(vc_col) if vc_col else None
-        try:
-            bp_val = float(bp_val)
-        except Exception:
-            pass
-        try:
-            vc_val = float(vc_val)
+            self._set_status(msg)
+            if getattr(self, "_flash_after_id", None):
+                try: self.after_cancel(self._flash_after_id)
+                except Exception: pass
+            def _clear():
+                try: self._set_status("")
+                except Exception: pass
+            self._flash_after_id = self.after(ms, _clear)
         except Exception:
             pass
 
-        # Columns to plot
-        selected_cols = self.scrolled_checks.selected_columns()
-        if not selected_cols:
-            messagebox.showerror("No columns", "Select at least one column to plot.")
-            return
-        xs, ys = parse_flow_xy_from_columns(sel_row, selected_cols)
-        include_trendline = bool(self.trend_var.get())
+    def _prompt_text(self, title: str, prompt: str, default: str = "") -> Optional[str]:
+        win = tk.Toplevel(self); win.title(title)
+        ttk.Label(win, text=prompt).pack(side="top", anchor="w", padx=10, pady=(10, 4))
+        var = tk.StringVar(value=default)
+        ent = ttk.Entry(win, textvariable=var, width=40); ent.pack(side="top", padx=10, pady=(0, 10))
+        out = {"ok": False}
+        def ok(): out["ok"] = True; win.destroy()
+        def cancel(): win.destroy()
+        btns = ttk.Frame(win); btns.pack(side="top", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="OK", command=ok).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Cancel", command=cancel).pack(side="left")
+        ent.focus_set(); win.grab_set(); self.wait_window(win)
+        return var.get().strip() if out["ok"] else None
 
-        # Flow list text
-        flow_items: List[str] = []
-        for c in selected_cols:
-            setpoint = extract_first_float_from_text(str(c))
-            val = sel_row.get(c)
-            val_fmt = _fmt_val(val, 2)
-            if setpoint is not None:
-                flow_items.append(f"{setpoint:g} L/min \u2192 {val_fmt} \u00B5L/min")
-            else:
-                flow_items.append(f"{c}: {val_fmt} \u00B5L/min")
+    def _set_status(self, msg: str):
+        self.status_var.set(msg)
+        self.update_idletasks()
 
-        out_dir = self.outdir_var.get().strip() or (str(Path(self.xlsx_path).parent) if self.xlsx_path else str(Path.cwd()))
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        out_pdf = Path(out_dir) / f"label_{serial_value or 'row'}.pdf"
-
+    def on_close(self):
         try:
-            render_pdf_label_matplotlib(
-                out_pdf=out_pdf,
-                title_text=title_text,
-                title_color=title_color,
-                label_w_in=label_w_in,
-                label_h_in=label_h_in,
-                serial_value=serial_value,
-                backpressure_label=(bp_col or "Backpressure"),
-                backpressure_value=bp_val,
-                vacuum_label=(vc_col or "Vacuum"),
-                vacuum_value=vc_val,
-                flow_list_text=flow_items,
-                xs=xs,
-                ys=ys,
-                include_trendline=include_trendline,
-                leak_check=bool(self.leak_var.get()),
-                visual_check=bool(self.visual_var.get()),
-                plot_width_pct=plot_width_pct,
-                text_scale_pct=text_scale_pct,
-                margin_pct=margin_pct,
-            )
-            self.last_pdf = out_pdf
-            self.open_btn.configure(state="normal")
-            self.set_status(f"PDF generated: {out_pdf}")
-            self.on_save_settings()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate PDF: {e}")
-            self.set_status(f"Failed to generate PDF: {e}")
-
-    def on_open_pdf(self):
-        if not self.last_pdf or not self.last_pdf.exists():
-            messagebox.showwarning("No PDF", "No PDF has been generated yet.")
-            return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(str(self.last_pdf))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                os.system(f"open '{self.last_pdf}'")
-            else:
-                os.system(f"xdg-open '{self.last_pdf}'")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open PDF: {e}")
-
-    def _bind_spinbox_int(self, spin: tk.Spinbox, var: tk.IntVar, min_val: int, max_val: int, default: int):
-        """Clamp spinbox value on Enter/FocusOut to [min_val, max_val] or default if invalid."""
-        def clamp_event(_=None):
-            try:
-                v = int(var.get())
-            except Exception:
-                v = default
-            if v < min_val:
-                v = min_val
-            if v > max_val:
-                v = max_val
-            var.set(v)
-        spin.bind("<Return>", clamp_event)
-        spin.bind("<FocusOut>", clamp_event)
-        
-
-def safe_float(val, default):
-    """
-    Return a positive float from val, or default if parsing fails or <= 0.
-    """
-    try:
-        f = float(val)
-        return f if f > 0 else default
-    except Exception:
-        return default
-
+            self._sync_ui_to_profile()
+            save_profile(self.profile)
+        except Exception:
+            pass
+        self.master.destroy()
 
 def main():
     root = tk.Tk()
@@ -887,10 +1535,9 @@ def main():
             root.tk.call('tk', 'scaling', 1.25)
     except Exception:
         pass
-    App(root)
-    root.minsize(880, 640)
+    app = App(root)
+    root.minsize(980, 720)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
