@@ -144,6 +144,336 @@ class ScrollableFrame(ttk.Frame):
         except Exception:
             pass
 
+class LayoutEditor(ttk.Frame):
+    """
+    Visual layout editor for Template & Layout.
+    - Canvas shows a scaled label with inner margins.
+    - Drag the title/static text, labels/values columns, row start, graph splitter, and logo.
+    - Sliders for line height and graph margin; toggles for snap/grid/guides.
+    All positions stored as percentages of the inner label area (or the 'left' area for text/columns in graph mode),
+    matching the fields your renderer reads.
+    """
+    def __init__(self, parent, app, width=720, height=420):
+        super().__init__(parent)
+        self.app = app
+        self.W = width
+        self.H = height
+        self.bg = "#f7f7fa"
+        self.snap = tk.BooleanVar(value=True)
+        self.show_guides = tk.BooleanVar(value=True)
+
+        # Canvas
+        self.canvas = tk.Canvas(self, width=self.W, height=self.H, bg=self.bg, highlightthickness=1, highlightbackground="#ccc")
+        self.canvas.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # Controls row
+        ttk.Checkbutton(self, text="Snap to grid", variable=self.snap, command=self.refresh).grid(row=1, column=0, sticky="w")
+        ttk.Checkbutton(self, text="Show guides", variable=self.show_guides, command=self.refresh).grid(row=1, column=1, sticky="w")
+        ttk.Button(self, text="Reset layout", command=self.reset_layout).grid(row=1, column=2, sticky="w")
+
+        # Sliders
+        self.line_h_var = tk.DoubleVar(value=float(self._tpl("line_height_pct", 0.075)))
+        self.graph_margin_var = tk.IntVar(value=int(self._tpl("graph_margin_pct", self._profile("margin_pct", 7))))
+        ttk.Label(self, text="Line height").grid(row=2, column=0, sticky="w")
+        ttk.Scale(self, from_=0.04, to=0.12, orient="horizontal", variable=self.line_h_var, command=lambda *_: self._on_line_h_change()).grid(row=2, column=1, sticky="we", padx=(6, 12))
+        ttk.Label(self, text="Graph margin %").grid(row=2, column=2, sticky="e")
+        ttk.Spinbox(self, from_=0, to=25, width=5, textvariable=self.graph_margin_var, command=self._on_graph_margin_change, justify="right").grid(row=2, column=3, sticky="w")
+
+        # Internal: canvas items
+        self.items = {}
+        self.drag = {"item": None, "kind": None, "dx": 0, "dy": 0, "anchor": None}
+
+        # Bind mouse
+        self.canvas.bind("<Button-1>", self._on_down)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_up)
+
+        self.refresh()
+
+    # --------- profile helpers ---------
+    def _profile(self, key, default=None):
+        return self.app.profile.get(key, default)
+
+    def _tpl(self, key, default=None):
+        return self.app.profile.get("template", {}).get(key, default)
+
+    def _bindings(self):
+        return self.app.profile.setdefault("bindings", {})
+
+    def _setp(self, key, val):
+        self.app.profile[key] = val
+        try: self.app._schedule_autosave()
+        except Exception: pass
+
+    def _sett(self, key, val):
+        self.app.profile.setdefault("template", {})[key] = val
+        try: self.app._schedule_autosave()
+        except Exception: pass
+
+    # --------- geometry helpers ---------
+    def _snapv(self, v, step):
+        return round(v / step) * step if self.snap.get() else v
+
+    def _inner_rect(self):
+        # Returns inner rectangle (left, top, right, bottom) in canvas coords, after margins
+        margin_pct = int(self._profile("margin_pct", 7))
+        m = (margin_pct / 100.0)
+        l = self.W * m
+        t = self.H * m
+        r = self.W * (1 - m)
+        b = self.H * (1 - m)
+        return l, t, r, b
+
+    def _split_left_rect(self):
+        # Left area (values/labels) rect; if graph enabled, split by plot_width_pct
+        l, t, r, b = self._inner_rect()
+        include_graph = bool(self._tpl("include_graph", False))
+        if not include_graph:
+            return l, t, r, b, None  # left, top, right, bottom, splitter_x
+        plotw = int(self._profile("plot_width_pct", 52))
+        plotw = max(30, min(80, plotw))
+        right_frac = plotw / 100.0
+        total_w = r - l
+        left_w = total_w * (1.0 - right_frac)
+        split_x = l + left_w
+        return l, t, split_x, b, split_x
+
+    def _left_localize(self, x_canvas, y_canvas):
+        # Convert canvas coords to normalized 0..1 within left area
+        l, t, r, b, _ = self._split_left_rect()
+        u = 0.0 if r <= l else (x_canvas - l) / (r - l)
+        v = 0.0 if b <= t else (y_canvas - t) / (b - t)
+        return max(0.0, min(1.0, u)), max(0.0, min(1.0, v))
+
+    def _left_to_canvas(self, u, v):
+        l, t, r, b, _ = self._split_left_rect()
+        x = l + u * (r - l)
+        y = t + v * (b - t)
+        return x, y
+
+    # --------- drawing ---------
+    def refresh(self):
+        self.canvas.delete("all")
+        # Background inner/outer
+        l, t, r, b = 8, 8, self.W - 8, self.H - 8
+        self.canvas.create_rectangle(l, t, r, b, outline="#bbb", width=1, fill="#fff")
+
+        il, it, ir, ib = self._inner_rect()
+        self.canvas.create_rectangle(il, it, ir, ib, outline="#222", width=1)
+
+        # Left vs graph split
+        ll, lt, lr, lb, split_x = self._split_left_rect()
+        self.canvas.create_rectangle(ll, lt, lr, lb, outline="#999", width=1)
+        include_graph = bool(self._tpl("include_graph", False))
+        if include_graph:
+            # draw graph area
+            self.canvas.create_rectangle(lr, lt, ir, ib, outline="#999", width=1)
+            # splitter bar
+            self.items["splitter"] = self.canvas.create_rectangle(lr - 3, lt, lr + 3, lb, fill="#0E6CD6", outline="")
+        else:
+            self.items["splitter"] = None
+
+        # Guides (grid)
+        if self.show_guides.get():
+            step = 0.05
+            # vertical grid in left area
+            x = 0.0
+            while x <= 1.0001:
+                cx, _ = self._left_to_canvas(x, 0.0)
+                self.canvas.create_line(cx, lt, cx, lb, fill="#eee")
+                x += step
+            # horizontal grid
+            y = 0.0
+            while y <= 1.0001:
+                _, cy = self._left_to_canvas(0.0, y)
+                self.canvas.create_line(ll, cy, lr, cy, fill="#eee")
+                y += step
+
+        # Title handle
+        ux = float(self._profile("title_x_pct", 0.0))
+        uy = float(self._profile("title_y_pct", 0.96))
+        ux = max(0.0, min(1.0, ux)); uy = max(0.0, min(1.0, uy))
+        tx, ty = self._left_to_canvas(ux, uy)
+        self.items["title"] = self.canvas.create_oval(tx-6, ty-6, tx+6, ty+6, fill="#333", outline="white")
+        self.canvas.create_text(tx+10, ty, text="Title", anchor="w", fill="#333")
+
+        # Static text handle (if enabled)
+        if bool(self._profile("static_text_enabled", False)):
+            sux = float(self._profile("static_text_x_pct", 0.0))
+            suy = float(self._profile("static_text_y_pct", 0.86))
+            sx, sy = self._left_to_canvas(sux, suy)
+            self.items["static"] = self.canvas.create_rectangle(sx-6, sy-6, sx+6, sy+6, fill="#444", outline="white")
+            self.canvas.create_text(sx+10, sy, text="Static text", anchor="w", fill="#444")
+        else:
+            self.items["static"] = None
+
+        # Labels/Values columns and top row start
+        lx = float(self._profile("labels_x_pct", 0.0))
+        vx = self._profile("values_x_pct", None)
+        gap = float(self._profile("label_value_gap_pct", 0.10))
+        if vx is None:
+            vx = lx + gap
+        ly = float(self._profile("rows_top_y_pct", 0.78))
+        lx = max(0.0, min(1.0, lx)); vx = max(0.0, min(1.0, vx)); ly = max(0.0, min(1.0, ly))
+
+        lcx, lcy = self._left_to_canvas(lx, ly)
+        vcx, vcy = self._left_to_canvas(vx, ly)
+        # vertical handles
+        self.items["labels_col"] = self.canvas.create_line(lcx, lt, lcx, lb, fill="#0a7", width=2)
+        self.items["values_col"] = self.canvas.create_line(vcx, lt, vcx, lb, fill="#a70", width=2)
+        # row start handle
+        self.items["rows_top"] = self.canvas.create_oval(lcx-5, lcy-5, lcx+5, lcy+5, fill="#0a7", outline="white")
+        self.canvas.create_text(lcx+10, lcy, text="Row start", anchor="w", fill="#0a7")
+
+        # Logo box (value labels only)
+        bindings = self._bindings()
+        logo_path = (bindings.get("logo_path", "") or "").strip()
+        if (not include_graph) and logo_path:
+            x_pct = float(self._profile("logo_x_pct", 0.02))
+            y_pct = float(self._profile("logo_y_pct", 0.70))
+            w_pct = float(self._profile("logo_w_pct", 0.28))
+            h_pct = float(self._profile("logo_h_pct", 0.0))  # 0 = auto height by width
+            # absolute in inner area (not just left side)
+            il, it, ir, ib = self._inner_rect()
+            L = il + x_pct * (ir - il)
+            T = it + y_pct * (ib - it)
+            W = w_pct * (ir - il)
+            if h_pct and h_pct > 0:
+                H = h_pct * (ib - it)
+            else:
+                H = W * 0.35
+            self.items["logo_box"] = self.canvas.create_rectangle(L, T, L+W, T+H, outline="#08c", width=2)
+            # resize handle
+            self.items["logo_resize"] = self.canvas.create_rectangle(L+W-6, T+H-6, L+W+6, T+H+6, fill="#08c", outline="")
+        else:
+            self.items["logo_box"] = None
+            self.items["logo_resize"] = None
+
+        # Labels under controls
+        self.canvas.create_text(ll+8, lb-14, text="Drag dots/lines to move; drag splitter to resize graph area; drag logo to move/resize", anchor="w", fill="#666", font=("Segoe UI", 9))
+
+    # --------- event handlers ---------
+    def _hit_kind(self, item):
+        for k, it in self.items.items():
+            if it == item:
+                return k
+        return None
+
+    def _on_down(self, e):
+        item = self.canvas.find_closest(e.x, e.y)[0]
+        kind = self._hit_kind(item)
+        self.drag = {"item": item, "kind": kind, "dx": e.x, "dy": e.y, "anchor": None}
+
+    def _on_drag(self, e):
+        if not self.drag["item"]:
+            return
+        kind = self.drag["kind"]
+        dx = e.x - self.drag["dx"]
+        dy = e.y - self.drag["dy"]
+        self.drag["dx"], self.drag["dy"] = e.x, e.y
+
+        if kind in ("title", "static"):
+            # move within left area
+            u, v = self._left_localize(e.x, e.y)
+            step = 0.02
+            u = self._snapv(u, step); v = self._snapv(v, step)
+            if kind == "title":
+                self._setp("title_x_pct", u); self._setp("title_y_pct", v)
+            else:
+                self._setp("static_text_x_pct", u); self._setp("static_text_y_pct", v)
+            self.refresh(); return
+
+        if kind in ("labels_col", "values_col"):
+            # horizontal drag; lock y
+            ll, lt, lr, lb, _ = self._split_left_rect()
+            x = max(ll, min(lr, e.x))
+            u, _ = self._left_localize(x, lt)
+            u = self._snapv(u, 0.02)
+            if kind == "labels_col":
+                self._setp("labels_x_pct", u)
+            else:
+                self._setp("values_x_pct", u)
+            self.refresh(); return
+
+        if kind == "rows_top":
+            # vertical drag for row start
+            _, v = self._left_localize(self.drag["dx"], e.y)
+            v = self._snapv(v, 0.02)
+            self._setp("rows_top_y_pct", v)
+            self.refresh(); return
+
+        if kind == "splitter":
+            # adjust plot width by dragging splitter horizontally
+            il, it, ir, ib = self._inner_rect()
+            total_w = ir - il
+            # clamp inside inner rect
+            x = max(il + total_w * 0.2, min(ir - total_w * 0.2, e.x))
+            left_w = x - il
+            right_frac = 1.0 - (left_w / total_w)
+            plotw = int(round(right_frac * 100))
+            plotw = max(30, min(80, plotw))
+            self._setp("plot_width_pct", plotw)
+            self.refresh(); return
+
+        if kind in ("logo_box", "logo_resize"):
+            il, it, ir, ib = self._inner_rect()
+            # current box
+            x1, y1, x2, y2 = self.canvas.coords(self.items["logo_box"])
+            if kind == "logo_box":
+                # move
+                nx1 = max(il, min(ir, x1 + dx))
+                ny1 = max(it, min(ib, y1 + dy))
+                w = x2 - x1; h = y2 - y1
+                nx2 = max(il, min(ir, nx1 + w))
+                ny2 = max(it, min(ib, ny1 + h))
+            else:
+                # resize from bottom-right
+                nx1, ny1 = x1, y1
+                nx2 = max(nx1 + 10, min(ir, x2 + dx))
+                ny2 = max(ny1 + 10, min(ib, y2 + dy))
+            # write back as pct
+            x_pct = (nx1 - il) / (ir - il)
+            y_pct = (ny1 - it) / (ib - it)
+            w_pct = (nx2 - nx1) / (ir - il)
+            h_pct = (ny2 - ny1) / (ib - it)
+            # snap
+            step = 0.01
+            x_pct = self._snapv(x_pct, step); y_pct = self._snapv(y_pct, step)
+            w_pct = self._snapv(w_pct, step); h_pct = self._snapv(h_pct, step)
+            self._setp("logo_x_pct", x_pct)
+            self._setp("logo_y_pct", y_pct)
+            self._setp("logo_w_pct", w_pct)
+            self._setp("logo_h_pct", max(0.0, h_pct))
+            self.refresh(); return
+
+    def _on_up(self, e):
+        self.drag = {"item": None, "kind": None, "dx": 0, "dy": 0, "anchor": None}
+
+    def _on_line_h_change(self):
+        self._setp("line_height_pct", float(self.line_h_var.get()))
+        self.refresh()
+
+    def _on_graph_margin_change(self):
+        self._setp("graph_margin_pct", int(self.graph_margin_var.get()))
+        self.refresh()
+
+    def reset_layout(self):
+        # Reasonable defaults
+        self._setp("title_x_pct", 0.0)
+        self._setp("title_y_pct", 0.96)
+        self._setp("static_text_x_pct", 0.0)
+        self._setp("static_text_y_pct", 0.86)
+        self._setp("labels_x_pct", 0.0)
+        # If values_x_pct absent, renderer uses gap; here we set it explicitly near 0.6
+        self._setp("values_x_pct", 0.6)
+        self._setp("rows_top_y_pct", 0.78)
+        self._setp("line_height_pct", 0.075)
+        self._setp("graph_margin_pct", int(self._profile("margin_pct", 7)))
+        # Keep current plot_width_pct; leave logo as-is
+        self.refresh()
+
 class App(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -203,7 +533,22 @@ class App(ttk.Frame):
 
         self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
-
+    def _clamp_inch(self, val, default):
+        """
+        Convert val to float and clamp to a safe printable range [0.5, 24.0] inches.
+        Falls back to default on bad input.
+        """
+        try:
+            v = float(val)
+        except Exception:
+            try:
+                v = float(default)
+            except Exception:
+                v = 1.0
+        if not (np.isfinite(v)):
+            v = float(default) if isinstance(default, (int, float)) else 1.0
+        return max(0.5, min(24.0, float(v)))
+    
     def _init_style(self):
         style = ttk.Style()
         try:
@@ -451,7 +796,12 @@ class App(ttk.Frame):
         # Header (fixed, non-scrolling)
         self._make_profile_header(tab)
 
-        f = ttk.Frame(tab); f.pack(fill="x", padx=10, pady=10)
+        # Make everything below the header scrollable
+        sf = ScrollableFrame(tab)
+        sf.pack(fill="both", expand=True, padx=6, pady=6)
+        container = sf.scrollable_frame
+
+        f = ttk.Frame(container); f.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(f, text="Profile:").grid(row=0, column=0, sticky="w")
         self.profile_pick_var = tk.StringVar()
@@ -469,76 +819,161 @@ class App(ttk.Frame):
         ttk.Button(f, text="Save As...", command=self.on_save_as_profile).grid(row=1, column=3, pady=(8, 0))
         ttk.Button(f, text="Delete", command=self.on_delete_profile).grid(row=1, column=4, pady=(8, 0))
 
-        # Profile tab Serial (row) picker (mirrors Data Source tab) with typing support
+        # Profile tab Serial (row) picker (mirrors Data Source tab)
         ttk.Label(f, text="Serial (row):").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.profile_serial_pick_var = tk.StringVar()
         self.profile_serial_pick_menu = ttk.Combobox(f, textvariable=self.profile_serial_pick_var, width=40, state="normal")
         self.profile_serial_pick_menu.grid(row=2, column=1, sticky="w", padx=(6, 6), pady=(8, 0))
         self.profile_serial_pick_menu.bind("<<ComboboxSelected>>", lambda e: self._on_profile_tab_serial_selected())
-        # Type-to-select handlers
         self.profile_serial_pick_menu.bind("<KeyRelease>", self._on_serial_typed_profile)
         self.profile_serial_pick_menu.bind("<Return>", self._on_serial_typed_profile)
 
         f.columnconfigure(1, weight=1)
 
         # -- Template & Layout --
-        tf = ttk.LabelFrame(tab, text="Template & Layout")
+        tf = ttk.LabelFrame(container, text="Template & Layout")
         tf.pack(fill="x", padx=10, pady=(6, 10))
 
-        self.include_graph_var = tk.BooleanVar(value=bool(self.profile.get("template", {}).get("include_graph", False)))
-        ttk.Checkbutton(tf, text="Include graph", variable=self.include_graph_var, command=self._ensure_graph_ui_ready).grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        # === Mode & Size (clamped) ===
+        try:
+            self.profile["label_w_in"] = self._clamp_inch(self.win_var.get(), self.profile.get("label_w_in", 3.0))
+        except Exception:
+            pass
+        try:
+            self.profile["label_h_in"] = self._clamp_inch(self.hin_var.get(), self.profile.get("label_h_in", 4.0))
+        except Exception:
+            pass
+        try:
+            self.profile["margin_pct"] = int(self.margin_var.get())
+        except Exception:
+            pass
+        try:
+            self.profile["text_scale_pct"] = int(self.text_scale_var.get())
+        except Exception:
+            pass
+        try:
+            # Keep your existing bounds elsewhere if needed; this just records the value
+            self.profile["plot_width_pct"] = int(self.plotw_var.get())
+        except Exception:
+            pass
 
-        ttk.Label(tf, text="Graph scale:").grid(row=0, column=1, sticky="e")
-        self.graph_scale_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_scale", 1.0)))
-        ttk.Entry(tf, textvariable=self.graph_scale_var, width=6).grid(row=0, column=2, sticky="w", padx=(6, 12))
-
-        ttk.Label(tf, text="Graph X:").grid(row=0, column=3, sticky="e")
-        self.graph_x_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_x", 0.0)))
-        ttk.Entry(tf, textvariable=self.graph_x_var, width=6).grid(row=0, column=4, sticky="w", padx=(6, 12))
-
-        ttk.Label(tf, text="Graph Y:").grid(row=0, column=5, sticky="e")
-        self.graph_y_var = tk.DoubleVar(value=float(self.profile.get("template", {}).get("graph_y", 0.0)))
-        ttk.Entry(tf, textvariable=self.graph_y_var, width=6).grid(row=0, column=6, sticky="w", padx=(6, 12))
-
-        # Title color + Pick button
-        ttk.Label(tf, text="Title color (hex):").grid(row=1, column=0, sticky="w")
+        # Title section
+        titlef = ttk.LabelFrame(container, text="Title")
+        titlef.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(titlef, text="Color:").grid(row=0, column=0, sticky="e")
         self.title_color_var = tk.StringVar(value=self.profile.get("title_color", DEFAULT_TITLE_COLOR))
-        ttk.Entry(tf, textvariable=self.title_color_var, width=12).grid(row=1, column=1, sticky="w", padx=(6, 6))
-        ttk.Button(tf, text="Pick...", command=lambda: self._choose_color(self.title_color_var)).grid(row=1, column=6, sticky="w")
+        ttk.Entry(titlef, textvariable=self.title_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(titlef, text="Pick…", command=lambda: self._choose_color(self.title_color_var)).grid(row=0, column=2, sticky="w")
 
-        ttk.Label(tf, text="Text scale %:").grid(row=1, column=2, sticky="w", pady=(8, 0))
-        self.text_scale_var = tk.IntVar(value=int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
-        ttk.Spinbox(tf, from_=60, to=160, increment=1, textvariable=self.text_scale_var, width=6, justify="right").grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(titlef, text="Text size:").grid(row=0, column=3, sticky="e")
+        self.title_size_var = tk.IntVar(value=int(self.profile.get("title_font_size", 16)))
+        ttk.Spinbox(titlef, from_=8, to=72, increment=1, textvariable=self.title_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
 
-        ttk.Label(tf, text="Margins %:").grid(row=1, column=4, sticky="w", pady=(8, 0))
-        self.margin_var = tk.IntVar(value=int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
-        ttk.Spinbox(tf, from_=3, to=15, increment=1, textvariable=self.margin_var, width=6, justify="right").grid(row=1, column=5, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(titlef, text="Vertical position (Y %):").grid(row=0, column=5, sticky="e")
+        self.title_y_pct_var = tk.DoubleVar(value=float(self.profile.get("title_y_pct", 96.0)))
+        ttk.Spinbox(titlef, from_=0.0, to=100.0, increment=0.5, textvariable=self.title_y_pct_var, width=8, justify="right").grid(row=0, column=6, sticky="w", padx=(6, 12))
 
-        ttk.Label(tf, text="Label W (in):").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.win_var = tk.StringVar(value=str(self.profile.get("label_w_in", 3.0)))
-        ttk.Entry(tf, textvariable=self.win_var, width=6).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
-        ttk.Label(tf, text="H:").grid(row=2, column=2, sticky="w", pady=(8, 0))
-        self.hin_var = tk.StringVar(value=str(self.profile.get("label_h_in", 4.0)))
-        ttk.Entry(tf, textvariable=self.hin_var, width=6).grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+        # Subtitle section
+        subf = ttk.LabelFrame(container, text="Subtitle")
+        subf.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(subf, text="Color:").grid(row=0, column=0, sticky="e")
+        self.subtitle_color_var = tk.StringVar(value=self.profile.get("subtitle_color", "#333333"))
+        ttk.Entry(subf, textvariable=self.subtitle_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(subf, text="Pick…", command=lambda: self._choose_color(self.subtitle_color_var)).grid(row=0, column=2, sticky="w")
 
-        # Plot width and Graph line color + Pick
-        ttk.Label(tf, text="Plot width % (graph):").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        self.plotw_var = tk.IntVar(value=int(self.profile.get("plot_width_pct", DEFAULT_PLOT_WIDTH_PCT)))
-        self.plotw_spin = ttk.Spinbox(tf, from_=30, to=80, increment=1, textvariable=self.plotw_var, width=6, justify="right")
-        self.plotw_spin.grid(row=3, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(subf, text="Text size:").grid(row=0, column=3, sticky="e")
+        self.subtitle_size_var = tk.IntVar(value=int(self.profile.get("subtitle_font_size", 12)))
+        ttk.Spinbox(subf, from_=8, to=48, increment=1, textvariable=self.subtitle_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
 
-        ttk.Label(tf, text="Graph line color:").grid(row=3, column=2, sticky="e")
+        ttk.Label(subf, text="Vertical position (Y %):").grid(row=0, column=5, sticky="e")
+        self.subtitle_y_pct_var = tk.DoubleVar(value=float(self.profile.get("subtitle_y_pct", 86.0)))
+        ttk.Spinbox(subf, from_=0.0, to=100.0, increment=0.5, textvariable=self.subtitle_y_pct_var, width=8, justify="right").grid(row=0, column=6, sticky="w", padx=(6, 12))
+
+        # Labels section
+        labf = ttk.LabelFrame(container, text="Labels")
+        labf.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(labf, text="Color:").grid(row=0, column=0, sticky="e")
+        self.labels_color_var = tk.StringVar(value=self.profile.get("labels_color", "#333333"))
+        ttk.Entry(labf, textvariable=self.labels_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(labf, text="Pick…", command=lambda: self._choose_color(self.labels_color_var)).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(labf, text="Text size:").grid(row=0, column=3, sticky="e")
+        self.labels_size_var = tk.IntVar(value=int(self.profile.get("labels_font_size", 11)))
+        ttk.Spinbox(labf, from_=8, to=36, increment=1, textvariable=self.labels_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
+
+        ttk.Label(labf, text="Top row Y %:").grid(row=0, column=5, sticky="e")
+        self.rows_top_y_pct_var = tk.DoubleVar(value=float(self.profile.get("rows_top_y_pct", 78.0)))
+        ttk.Spinbox(labf, from_=0.0, to=100.0, increment=0.5, textvariable=self.rows_top_y_pct_var, width=8, justify="right").grid(row=0, column=6, sticky="w", padx=(6, 12))
+
+        ttk.Label(labf, text="Line height %:").grid(row=1, column=0, sticky="e", pady=(6, 0))
+        self.line_height_pct_var = tk.DoubleVar(value=float(self.profile.get("line_height_pct", 7.5)))
+        ttk.Spinbox(labf, from_=3.0, to=15.0, increment=0.5, textvariable=self.line_height_pct_var, width=8, justify="right").grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        ttk.Label(labf, text="Label/Value gap %:").grid(row=1, column=3, sticky="e", pady=(6, 0))
+        self.label_value_gap_pct_var = tk.DoubleVar(value=float(self.profile.get("label_value_gap_pct", 10.0)))
+        ttk.Spinbox(labf, from_=0.0, to=40.0, increment=0.5, textvariable=self.label_value_gap_pct_var, width=8, justify="right").grid(row=1, column=4, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        # Values section
+        valf = ttk.LabelFrame(container, text="Label Values")
+        valf.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(valf, text="Color:").grid(row=0, column=0, sticky="e")
+        self.values_color_var = tk.StringVar(value=self.profile.get("values_color", "#000000"))
+        ttk.Entry(valf, textvariable=self.values_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(valf, text="Pick…", command=lambda: self._choose_color(self.values_color_var)).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(valf, text="Text size:").grid(row=0, column=3, sticky="e")
+        self.values_size_var = tk.IntVar(value=int(self.profile.get("values_font_size", 11)))
+        ttk.Spinbox(valf, from_=8, to=36, increment=1, textvariable=self.values_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
+
+        # Graph Axis section (only meaningful when graph is ON)
+        axf = ttk.LabelFrame(container, text="Graph Axis & Line")
+        axf.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(axf, text="Axis label size:").grid(row=0, column=0, sticky="e")
+        self.axis_label_size_var = tk.IntVar(value=int(self.profile.get("axis_label_font_size", 8)))
+        ttk.Spinbox(axf, from_=6, to=24, increment=1, textvariable=self.axis_label_size_var, width=6, justify="right").grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(axf, text="Axis tick size:").grid(row=0, column=2, sticky="e")
+        self.axis_tick_size_var = tk.IntVar(value=int(self.profile.get("axis_tick_font_size", 6)))
+        ttk.Spinbox(axf, from_=6, to=20, increment=1, textvariable=self.axis_tick_size_var, width=6, justify="right").grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(axf, text="Axis color:").grid(row=0, column=4, sticky="e")
+        self.axis_color_var = tk.StringVar(value=self.profile.get("axis_color", "#666666"))
+        ttk.Entry(axf, textvariable=self.axis_color_var, width=10).grid(row=0, column=5, sticky="w", padx=(6, 6))
+        ttk.Button(axf, text="Pick…", command=lambda: self._choose_color(self.axis_color_var)).grid(row=0, column=6, sticky="w")
+
+        ttk.Label(axf, text="Graph line color:").grid(row=1, column=0, sticky="e", pady=(6, 0))
         self.graph_line_color_var = tk.StringVar(value=self.profile.get("graph_line_color", "#1F77B4"))
-        ttk.Entry(tf, textvariable=self.graph_line_color_var, width=12).grid(row=3, column=3, sticky="w", padx=(6, 6))
-        ttk.Button(tf, text="Pick...", command=lambda: self._choose_color(self.graph_line_color_var)).grid(row=3, column=4, sticky="w")
+        ttk.Entry(axf, textvariable=self.graph_line_color_var, width=10).grid(row=1, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
+        ttk.Button(axf, text="Pick…", command=lambda: self._choose_color(self.graph_line_color_var)).grid(row=1, column=2, sticky="w", pady=(6, 0))
 
-        ttk.Label(tf, text="Template text:").grid(row=4, column=0, sticky="nw", padx=4, pady=(8,3))
-        self.template_text = tk.Text(tf, width=76, height=6)
-        self.template_text.grid(row=4, column=1, columnspan=6, padx=4, pady=(8,3))
-        self.template_text.insert("1.0", self.profile.get("template", {}).get("template_text", ""))
+        self.grid_enabled_var = tk.BooleanVar(value=bool(self.profile.get("grid_enabled", True)))
+        ttk.Checkbutton(axf, text="Show grid", variable=self.grid_enabled_var).grid(row=1, column=3, sticky="w", pady=(6, 0))
 
-        # Output (inside Profile tab)
-        of = ttk.LabelFrame(tab, text="Output")
+        # Logo section (applies with or without graph)
+        logof = ttk.LabelFrame(container, text="Logo (applies to all templates)")
+        logof.pack(fill="x", padx=10, pady=(0, 10))
+        self.logo_enabled_var = tk.BooleanVar(value=bool(self.profile.get("logo_enabled", False)))
+        ttk.Checkbutton(logof, text="Include logo", variable=self.logo_enabled_var).grid(row=0, column=0, sticky="w")
+
+        ttk.Label(logof, text="Path:").grid(row=0, column=1, sticky="e")
+        self.tpl_logo_path_var = tk.StringVar(value=self.profile.get("bindings", {}).get("logo_path", ""))  # keep compatibility
+        ttk.Entry(logof, textvariable=self.tpl_logo_path_var, width=48).grid(row=0, column=2, columnspan=2, sticky="w", padx=(6, 6))
+        ttk.Button(logof, text="Browse…", command=self._browse_logo).grid(row=0, column=4, sticky="w")
+
+        ttk.Label(logof, text="Vertical position (Y %):").grid(row=1, column=0, sticky="e", pady=(6, 0))
+        self.logo_y_pct_var = tk.DoubleVar(value=float(self.profile.get("logo_y_pct", 70.0)))
+        ttk.Spinbox(logof, from_=0.0, to=100.0, increment=0.5, textvariable=self.logo_y_pct_var, width=8, justify="right").grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        ttk.Label(logof, text="Width % (of label):").grid(row=1, column=2, sticky="e", pady=(6, 0))
+        self.logo_w_pct_var = tk.DoubleVar(value=float(self.profile.get("logo_w_pct", 28.0)))
+        ttk.Spinbox(logof, from_=5.0, to=80.0, increment=0.5, textvariable=self.logo_w_pct_var, width=8, justify="right").grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(6, 0))
+
+        ttk.Label(logof, text="Align:").grid(row=1, column=4, sticky="e", pady=(6, 0))
+        self.logo_align_var = tk.StringVar(value=self.profile.get("logo_align", "left"))
+        ttk.Combobox(logof, textvariable=self.logo_align_var, state="readonly", values=["left", "center", "right"], width=8).grid(row=1, column=5, sticky="w", pady=(6, 0))
+
+        # Output (inside scroll area)
+        of = ttk.LabelFrame(container, text="Output")
         of.pack(fill="x", padx=10, pady=(6, 10))
 
         ttk.Label(of, text="Output target:").grid(row=0, column=0, sticky="w")
@@ -560,6 +995,7 @@ class App(ttk.Frame):
         ttk.Checkbutton(of, text="Open after export", variable=self.open_after_var).grid(row=3, column=1, sticky="w", pady=(8, 0))
 
         ttk.Label(of, text="Output folder:").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.outdir_var = getattr(self, "outdir_var", tk.StringVar(value=str(Path.cwd())))
         ttk.Entry(of, textvariable=self.outdir_var, width=54).grid(row=4, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
         ttk.Button(of, text="Browse...", command=self._browse_outdir).grid(row=4, column=2, sticky="w", pady=(8, 0))
 
@@ -703,6 +1139,11 @@ class App(ttk.Frame):
             pass
         try:
             self._update_graph_controls_visibility()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "layout_editor") and self.layout_editor is not None:
+                self.layout_editor.refresh()
         except Exception:
             pass
         try:
@@ -1132,6 +1573,8 @@ class App(ttk.Frame):
         except Exception:
             pass
 
+
+
     def _update_profile_serial_menu_values(self, serial_list: List[str]):
         """
         Update the Serial (row) combobox on the Profile tab with the provided values and select an appropriate default.
@@ -1150,6 +1593,7 @@ class App(ttk.Frame):
             pass
 
     # ========== Profile/UI sync and autosave ==========
+    
     def _attach_profile_traces(self):
         def _safe_add_trace(var, cb):
             try:
@@ -1158,44 +1602,51 @@ class App(ttk.Frame):
             except Exception:
                 pass
 
-        _safe_add_trace(getattr(self, "profile_pick_var", None), lambda *a: None)
-        # Update header immediately and autosave on name change
-        _safe_add_trace(
-            getattr(self, "profile_name_var", None),
-            lambda *a: (self._update_profile_header(), self._schedule_autosave())
-        )
+        # Basic/profile
+        _safe_add_trace(getattr(self, "profile_name_var", None), lambda *a: (self._update_profile_header(), self._schedule_autosave()))
+        for nm in ("xlsx_var","sheet_var","serial_col_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
-        # Data-source fields
-        _safe_add_trace(getattr(self, "xlsx_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "sheet_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "serial_col_var", None), lambda *a: self._schedule_autosave())
+        # Mode & Size
+        for nm in ("win_var","hin_var","margin_var","text_scale_var","plotw_var","graph_margin_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
-        # Template/layout
-        _safe_add_trace(getattr(self, "title_color_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "text_scale_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "margin_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "win_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "hin_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "plotw_var", None), lambda *a: self._schedule_autosave())
-        # NEW: graph line color
-        _safe_add_trace(getattr(self, "graph_line_color_var", None), lambda *a: self._schedule_autosave())
+        # Title
+        for nm in ("title_color_var","title_size_var","title_y_pct_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
+
+        # Subtitle
+        for nm in ("subtitle_color_var","subtitle_size_var","subtitle_y_pct_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
+
+        # Labels and Values
+        for nm in ("labels_color_var","labels_size_var","rows_top_y_pct_var","line_height_pct_var","label_value_gap_pct_var","values_color_var","values_size_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
+
+        # Graph axis & line
+        for nm in ("axis_label_size_var","axis_tick_size_var","axis_color_var","graph_line_color_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
+        _safe_add_trace(getattr(self, "grid_enabled_var", None), lambda *a: self._schedule_autosave())
+
+        # Logo
+        for nm in ("logo_enabled_var","tpl_logo_path_var","logo_y_pct_var","logo_w_pct_var","logo_align_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
         # Output
-        _safe_add_trace(getattr(self, "target_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "fnp_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "copies_var", None), lambda *a: self._schedule_autosave())
-        _safe_add_trace(getattr(self, "open_after_var", None), lambda *a: self._schedule_autosave())
+        for nm in ("target_var","fnp_var","copies_var","open_after_var"):
+            _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
         # Include graph toggling
         def _include_graph_cb(*_):
             try:
                 self._toggle_binding_panels()
+                self._update_graph_controls_visibility()
             except Exception:
                 pass
             self._schedule_autosave()
         _safe_add_trace(getattr(self, "include_graph_var", None), _include_graph_cb)
 
-        # Template text saves on focus-out
+        # Template text saves on focus-out (if present)
         try:
             if hasattr(self, "template_text") and getattr(self, "template_text") is not None:
                 self.template_text.bind("<FocusOut>", lambda e: self._schedule_autosave())
@@ -1231,56 +1682,111 @@ class App(ttk.Frame):
         if not getattr(self, "profile", None):
             return
 
-        # Profile name
+        # Name
         try:
             if getattr(self, "profile_name_var", None):
                 self.profile["profile_name"] = self.profile_name_var.get().strip() or self.profile.get("profile_name")
         except Exception:
             pass
 
-        # Template & layout
+        # Template container
         self.profile.setdefault("template", {})
-        try:
-            # Read live UI state for include_graph to avoid stale profile reads
-            self.profile["template"]["include_graph"] = bool(self.include_graph_var.get())
-        except Exception:
-            pass
-        try:
-            self.profile["template"]["graph_scale"] = float(self.graph_scale_var.get())
-            self.profile["template"]["graph_x"] = float(self.graph_x_var.get())
-            self.profile["template"]["graph_y"] = float(self.graph_y_var.get())
-        except Exception:
-            pass
-        try:
-            if getattr(self, "template_text", None):
-                self.profile["template"]["template_text"] = self.template_text.get("1.0", "end").rstrip("\n")
-        except Exception:
-            pass
+        tpl = self.profile["template"]
 
-        # Colors and sizing
+        # Mode & Size
+        try: tpl["include_graph"] = bool(self.include_graph_var.get())
+        except Exception: pass
+        try: self.profile["label_w_in"] = float(self.win_var.get())
+        except Exception: pass
+        try: self.profile["label_h_in"] = float(self.hin_var.get())
+        except Exception: pass
+        try: self.profile["margin_pct"] = int(self.margin_var.get())
+        except Exception: pass
+        try: self.profile["text_scale_pct"] = int(self.text_scale_var.get())
+        except Exception: pass
+        try: self.profile["plot_width_pct"] = int(self.plotw_var.get())
+        except Exception: pass
+        try: self.profile["graph_margin_pct"] = int(self.graph_margin_var.get())
+        except Exception: pass
+
+        # Title
+        try: self.profile["title_color"] = (self.title_color_var.get() or DEFAULT_TITLE_COLOR).strip()
+        except Exception: pass
+        try: self.profile["title_font_size"] = int(self.title_size_var.get())
+        except Exception: pass
+        try: self.profile["title_y_pct"] = float(self.title_y_pct_var.get())
+        except Exception: pass
+
+        # Subtitle (format only; text lives in bindings["subtitle"])
+        try: self.profile["subtitle_color"] = (self.subtitle_color_var.get() or "#333333").strip()
+        except Exception: pass
+        try: self.profile["subtitle_font_size"] = int(self.subtitle_size_var.get())
+        except Exception: pass
+        try: self.profile["subtitle_y_pct"] = float(self.subtitle_y_pct_var.get())
+        except Exception: pass
+
+        # Labels / Values
+        try: self.profile["labels_color"] = (self.labels_color_var.get() or "#333333").strip()
+        except Exception: pass
+        try: self.profile["labels_font_size"] = int(self.labels_size_var.get())
+        except Exception: pass
+        try: self.profile["rows_top_y_pct"] = float(self.rows_top_y_pct_var.get())
+        except Exception: pass
+        try: self.profile["line_height_pct"] = float(self.line_height_pct_var.get())
+        except Exception: pass
+        try: self.profile["label_value_gap_pct"] = float(self.label_value_gap_pct_var.get())
+        except Exception: pass
+        try: self.profile["values_color"] = (self.values_color_var.get() or "#000000").strip()
+        except Exception: pass
+        try: self.profile["values_font_size"] = int(self.values_size_var.get())
+        except Exception: pass
+
+        # Graph axis & line
+        try: self.profile["axis_label_font_size"] = int(self.axis_label_size_var.get())
+        except Exception: pass
+        try: self.profile["axis_tick_font_size"] = int(self.axis_tick_size_var.get())
+        except Exception: pass
+        try: self.profile["axis_color"] = (self.axis_color_var.get() or "#666666").strip()
+        except Exception: pass
+        try: self.profile["graph_line_color"] = (self.graph_line_color_var.get() or "#1F77B4").strip()
+        except Exception: pass
+        try: self.profile["grid_enabled"] = bool(self.grid_enabled_var.get())
+        except Exception: pass
+
+        # Logo (path kept in bindings for compatibility; on/off + formatting here)
+        b = self.profile.setdefault("bindings", {})
         try:
-            self.profile["title_color"] = self.title_color_var.get().strip() or DEFAULT_TITLE_COLOR
-            # NEW: graph line color
-            if hasattr(self, "graph_line_color_var"):
-                self.profile["graph_line_color"] = (self.graph_line_color_var.get() or "").strip() or "#1F77B4"
-            self.profile["text_scale_pct"] = int(self.text_scale_var.get())
-            self.profile["margin_pct"] = int(self.margin_var.get())
-            self.profile["label_w_in"] = float(self.win_var.get())
-            self.profile["label_h_in"] = float(self.hin_var.get())
-            self.profile["plot_width_pct"] = int(self.plotw_var.get())
+            if hasattr(self, "tpl_logo_path_var") and self.tpl_logo_path_var.get() is not None:
+                b["logo_path"] = self.tpl_logo_path_var.get().strip()
+        except Exception:
+            pass
+        try: self.profile["logo_enabled"] = bool(self.logo_enabled_var.get())
+        except Exception: pass
+        try: self.profile["logo_y_pct"] = float(self.logo_y_pct_var.get())
+        except Exception: pass
+        try: self.profile["logo_w_pct"] = float(self.logo_w_pct_var.get())
+        except Exception: pass
+        try: self.profile["logo_align"] = (self.logo_align_var.get() or "left").strip()
+        except Exception: pass
+
+        # Template free text (if present)
+        try:
+            if hasattr(self, "template_text") and self.template_text is not None:
+                tpl["template_text"] = self.template_text.get("1.0", "end").rstrip("\n")
         except Exception:
             pass
 
         # Output
-        try:
-            self.profile["output_target"] = self.target_var.get()
-            self.profile["filename_pattern"] = self.fnp_var.get().strip() or "{serial}_{profile}.pdf"
-            self.profile["copies"] = int(self.copies_var.get())
-            self.profile["open_after"] = bool(self.open_after_var.get())
-        except Exception:
-            pass
+        try: self.profile["output_target"] = self.target_var.get()
+        except Exception: pass
+        try: self.profile["filename_pattern"] = self.fnp_var.get().strip() or "{serial}_{profile}.pdf"
+        except Exception: pass
+        try: self.profile["copies"] = int(self.copies_var.get())
+        except Exception: pass
+        try: self.profile["open_after"] = bool(self.open_after_var.get())
+        except Exception: pass
 
-        # Bindings save handled elsewhere when you click Save Bindings; still keep ds metadata
+        # Data-source metadata
         ds = self.profile.setdefault("data_source", {})
         try:
             if getattr(self, "xlsx_var", None) and self.xlsx_var.get():
@@ -1292,7 +1798,6 @@ class App(ttk.Frame):
         except Exception:
             pass
 
-        # Save
         try:
             save_profile(self.profile)
         except Exception:
@@ -1332,19 +1837,14 @@ class App(ttk.Frame):
             return fams
 
     def _choose_color(self, target_var: tk.StringVar):
-        """
-        Open a color picker and set the chosen hex code into target_var.
-        """
         try:
             from tkinter import colorchooser
             initial = (target_var.get() or "").strip() or "#000000"
             _rgb, hx = colorchooser.askcolor(title="Pick a color", initialcolor=initial)
             if hx:
                 target_var.set(hx)
-                try:
-                    self._schedule_autosave()
-                except Exception:
-                    pass
+                try: self._schedule_autosave()
+                except Exception: pass
         except Exception:
             pass
 
@@ -1385,10 +1885,8 @@ class App(ttk.Frame):
         if getattr(self, "xlsx_var", None):
             if ds.get("xlsx_path"):
                 try:
-                    self.xlsx_var.set(ds.get("xlsx_path"))
-                    self.xlsx_path = ds.get("xlsx_path")
-                except Exception:
-                    pass
+                    self.xlsx_var.set(ds.get("xlsx_path")); self.xlsx_path = ds.get("xlsx_path")
+                except Exception: pass
             if getattr(self, "sheet_menu", None):
                 try:
                     sheets = read_excel_sheet_names(ds.get("xlsx_path")) if ds.get("xlsx_path") else []
@@ -1397,52 +1895,94 @@ class App(ttk.Frame):
                         self.sheet_var.set(ds.get("sheet"))
                         try: self._load_sheet()
                         except Exception: pass
-                except Exception:
-                    pass
+                except Exception: pass
             if getattr(self, "serial_col_var", None):
-                try:
-                    self.serial_col_var.set(ds.get("serial_col", self.serial_col_var.get()))
-                except Exception:
-                    pass
+                try: self.serial_col_var.set(ds.get("serial_col", self.serial_col_var.get()))
+                except Exception: pass
             try:
-                if hasattr(self, "profile_serial_pick_var", None):
-                    last = ds.get("last_serial")
-                    if last:
-                        self.profile_serial_pick_var.set(last)
+                if hasattr(self, "profile_serial_pick_var", None) and ds.get("last_serial"):
+                    self.profile_serial_pick_var.set(ds.get("last_serial"))
             except Exception:
                 pass
 
-        # Template & layout
-        tpl = self.profile.get("template", {})
-        try: self.include_graph_var.set(bool(tpl.get("include_graph", False)))
-        except Exception: pass
-        try: self.graph_scale_var.set(float(tpl.get("graph_scale", 1.0)))
-        except Exception: pass
-        try: self.graph_x_var.set(float(tpl.get("graph_x", 0.0)))
-        except Exception: pass
-        try: self.graph_y_var.set(float(tpl.get("graph_y", 0.0)))
-        except Exception: pass
+        # Template & Layout
+        tpl = self.profile.get("template", {}) or {}
 
-        # Colors and sizing
-        try: self.title_color_var.set(self.profile.get("title_color", DEFAULT_TITLE_COLOR))
-        except Exception: pass
-        try:
-            if hasattr(self, "graph_line_color_var"):
-                self.graph_line_color_var.set(self.profile.get("graph_line_color", "#1F77B4"))
-        except Exception:
-            pass
-        try: self.text_scale_var.set(int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
-        except Exception: pass
-        try: self.margin_var.set(int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
+        # Mode & Size
+        try: self.include_graph_var.set(bool(tpl.get("include_graph", False)))
         except Exception: pass
         try: self.win_var.set(str(self.profile.get("label_w_in", 3.0)))
         except Exception: pass
         try: self.hin_var.set(str(self.profile.get("label_h_in", 4.0)))
         except Exception: pass
+        try: self.margin_var.set(int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
+        except Exception: pass
+        try: self.text_scale_var.set(int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
+        except Exception: pass
         try: self.plotw_var.set(int(self.profile.get("plot_width_pct", DEFAULT_PLOT_WIDTH_PCT)))
         except Exception: pass
+        try: self.graph_margin_var.set(int(self.profile.get("graph_margin_pct", self.profile.get("margin_pct", DEFAULT_MARGIN_PCT))))
+        except Exception: pass
 
-        # Template text
+        # Title
+        try: self.title_color_var.set(self.profile.get("title_color", DEFAULT_TITLE_COLOR))
+        except Exception: pass
+        try: self.title_size_var.set(int(self.profile.get("title_font_size", 16)))
+        except Exception: pass
+        try: self.title_y_pct_var.set(float(self.profile.get("title_y_pct", 96.0)))
+        except Exception: pass
+
+        # Subtitle
+        try: self.subtitle_color_var.set(self.profile.get("subtitle_color", "#333333"))
+        except Exception: pass
+        try: self.subtitle_size_var.set(int(self.profile.get("subtitle_font_size", 12)))
+        except Exception: pass
+        try: self.subtitle_y_pct_var.set(float(self.profile.get("subtitle_y_pct", 86.0)))
+        except Exception: pass
+
+        # Labels / Values
+        try: self.labels_color_var.set(self.profile.get("labels_color", "#333333"))
+        except Exception: pass
+        try: self.labels_size_var.set(int(self.profile.get("labels_font_size", 11)))
+        except Exception: pass
+        try: self.rows_top_y_pct_var.set(float(self.profile.get("rows_top_y_pct", 78.0)))
+        except Exception: pass
+        try: self.line_height_pct_var.set(float(self.profile.get("line_height_pct", 7.5)))
+        except Exception: pass
+        try: self.label_value_gap_pct_var.set(float(self.profile.get("label_value_gap_pct", 10.0)))
+        except Exception: pass
+        try: self.values_color_var.set(self.profile.get("values_color", "#000000"))
+        except Exception: pass
+        try: self.values_size_var.set(int(self.profile.get("values_font_size", 11)))
+        except Exception: pass
+
+        # Graph axis & line
+        try: self.axis_label_size_var.set(int(self.profile.get("axis_label_font_size", 8)))
+        except Exception: pass
+        try: self.axis_tick_size_var.set(int(self.profile.get("axis_tick_font_size", 6)))
+        except Exception: pass
+        try: self.axis_color_var.set(self.profile.get("axis_color", "#666666"))
+        except Exception: pass
+        try: self.graph_line_color_var.set(self.profile.get("graph_line_color", "#1F77B4"))
+        except Exception: pass
+        try: self.grid_enabled_var.set(bool(self.profile.get("grid_enabled", True)))
+        except Exception: pass
+
+        # Logo
+        try:
+            # path from bindings for compatibility
+            self.tpl_logo_path_var.set(self.profile.get("bindings", {}).get("logo_path", ""))
+        except Exception: pass
+        try: self.logo_enabled_var.set(bool(self.profile.get("logo_enabled", False)))
+        except Exception: pass
+        try: self.logo_y_pct_var.set(float(self.profile.get("logo_y_pct", 70.0)))
+        except Exception: pass
+        try: self.logo_w_pct_var.set(float(self.profile.get("logo_w_pct", 28.0)))
+        except Exception: pass
+        try: self.logo_align_var.set(self.profile.get("logo_align", "left"))
+        except Exception: pass
+
+        # Template text (if present)
         if getattr(self, "template_text", None):
             try:
                 self.template_text.delete("1.0", "end")
@@ -1465,7 +2005,7 @@ class App(ttk.Frame):
         except Exception:
             pass
 
-        # Keep bindings panel states sane
+        # Bindings panels and controls
         try: self._refresh_binding_columns()
         except Exception: pass
         try: self._toggle_binding_panels()
@@ -1473,9 +2013,7 @@ class App(ttk.Frame):
         try: self._update_graph_controls_visibility()
         except Exception: pass
 
-        # Update profile headers on every sync
-        try:
-            self._update_profile_header()
+        try: self._update_profile_header()
         except Exception:
             pass
 
