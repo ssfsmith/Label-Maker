@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
-
+import numpy as np
 from render import (
     PROFILE_DIR,
     TEMPLATE_GRAPH, TEMPLATE_VALUE_A, TEMPLATE_VALUE_B, TEMPLATE_VALUE_C,
@@ -819,7 +819,7 @@ class App(ttk.Frame):
         ttk.Button(f, text="Save As...", command=self.on_save_as_profile).grid(row=1, column=3, pady=(8, 0))
         ttk.Button(f, text="Delete", command=self.on_delete_profile).grid(row=1, column=4, pady=(8, 0))
 
-        # Profile tab Serial (row) picker (mirrors Data Source tab)
+        # Profile tab Serial (row) picker
         ttk.Label(f, text="Serial (row):").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.profile_serial_pick_var = tk.StringVar()
         self.profile_serial_pick_menu = ttk.Combobox(f, textvariable=self.profile_serial_pick_var, width=40, state="normal")
@@ -834,60 +834,89 @@ class App(ttk.Frame):
         tf = ttk.LabelFrame(container, text="Template & Layout")
         tf.pack(fill="x", padx=10, pady=(6, 10))
 
-        # === Mode & Size (clamped) ===
-        try:
-            self.profile["label_w_in"] = self._clamp_inch(self.win_var.get(), self.profile.get("label_w_in", 3.0))
-        except Exception:
-            pass
-        try:
-            self.profile["label_h_in"] = self._clamp_inch(self.hin_var.get(), self.profile.get("label_h_in", 4.0))
-        except Exception:
-            pass
-        try:
-            self.profile["margin_pct"] = int(self.margin_var.get())
-        except Exception:
-            pass
-        try:
-            self.profile["text_scale_pct"] = int(self.text_scale_var.get())
-        except Exception:
-            pass
-        try:
-            # Keep your existing bounds elsewhere if needed; this just records the value
-            self.profile["plot_width_pct"] = int(self.plotw_var.get())
-        except Exception:
-            pass
+        # Fonts list (init once)
+        self._font_families = getattr(self, "_font_families", None) or self._get_font_families()
 
-        # Title section
+        # Mode & Size
+        row = 0
+        self.include_graph_var = tk.BooleanVar(value=bool(self.profile.get("template", {}).get("include_graph", False)))
+        ttk.Checkbutton(tf, text="Include graph", variable=self.include_graph_var, command=self._ensure_graph_ui_ready).grid(row=row, column=0, sticky="w", padx=4, pady=4)
+
+        ttk.Label(tf, text="Label W (in):").grid(row=row, column=1, sticky="e")
+        self.win_var = tk.StringVar(value=str(self.profile.get("label_w_in", 3.0)))
+        ttk.Spinbox(tf, from_=0.5, to=24.0, increment=0.1, textvariable=self.win_var, width=6, justify="right").grid(row=row, column=2, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="H:").grid(row=row, column=3, sticky="e")
+        self.hin_var = tk.StringVar(value=str(self.profile.get("label_h_in", 4.0)))
+        ttk.Spinbox(tf, from_=0.5, to=24.0, increment=0.1, textvariable=self.hin_var, width=6, justify="right").grid(row=row, column=4, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Margins %:").grid(row=row, column=5, sticky="e")
+        self.margin_var = tk.IntVar(value=int(self.profile.get("margin_pct", DEFAULT_MARGIN_PCT)))
+        ttk.Spinbox(tf, from_=0, to=25, increment=1, textvariable=self.margin_var, width=6, justify="right").grid(row=row, column=6, sticky="w", padx=(6, 12))
+        row += 1
+
+        ttk.Label(tf, text="Text scale %:").grid(row=row, column=0, sticky="e")
+        self.text_scale_var = tk.IntVar(value=int(self.profile.get("text_scale_pct", DEFAULT_TEXT_SCALE_PCT)))
+        ttk.Spinbox(tf, from_=60, to=160, increment=1, textvariable=self.text_scale_var, width=6, justify="right").grid(row=row, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Plot width % (graph):").grid(row=row, column=2, sticky="e")
+        self.plotw_var = tk.IntVar(value=int(self.profile.get("plot_width_pct", DEFAULT_PLOT_WIDTH_PCT)))
+        ttk.Spinbox(tf, from_=30, to=80, increment=1, textvariable=self.plotw_var, width=6, justify="right").grid(row=row, column=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(tf, text="Graph margin %:").grid(row=row, column=4, sticky="e")
+        self.graph_margin_var = tk.IntVar(value=int(self.profile.get("graph_margin_pct", self.profile.get("margin_pct", DEFAULT_MARGIN_PCT))))
+        ttk.Spinbox(tf, from_=0, to=25, increment=1, textvariable=self.graph_margin_var, width=6, justify="right").grid(row=row, column=5, sticky="w", padx=(6, 12))
+        row += 1
+
+        # Title section (FORMAT + TEXT)
         titlef = ttk.LabelFrame(container, text="Title")
         titlef.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(titlef, text="Color:").grid(row=0, column=0, sticky="e")
+
+        ttk.Label(titlef, text="Text:").grid(row=0, column=0, sticky="e")
+        self.title_text_var = tk.StringVar(value=(self.profile.get("bindings", {}) or {}).get("title", ""))
+        ttk.Entry(titlef, textvariable=self.title_text_var, width=48).grid(row=0, column=1, columnspan=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(titlef, text="Color:").grid(row=1, column=0, sticky="e")
         self.title_color_var = tk.StringVar(value=self.profile.get("title_color", DEFAULT_TITLE_COLOR))
-        ttk.Entry(titlef, textvariable=self.title_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
-        ttk.Button(titlef, text="Pick…", command=lambda: self._choose_color(self.title_color_var)).grid(row=0, column=2, sticky="w")
+        ttk.Entry(titlef, textvariable=self.title_color_var, width=12).grid(row=1, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(titlef, text="Pick…", command=lambda: self._choose_color(self.title_color_var)).grid(row=1, column=2, sticky="w")
 
-        ttk.Label(titlef, text="Text size:").grid(row=0, column=3, sticky="e")
+        ttk.Label(titlef, text="Text size:").grid(row=1, column=3, sticky="e")
         self.title_size_var = tk.IntVar(value=int(self.profile.get("title_font_size", 16)))
-        ttk.Spinbox(titlef, from_=8, to=72, increment=1, textvariable=self.title_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
+        ttk.Spinbox(titlef, from_=8, to=72, increment=1, textvariable=self.title_size_var, width=6, justify="right").grid(row=1, column=4, sticky="w", padx=(6, 12))
 
-        ttk.Label(titlef, text="Vertical position (Y %):").grid(row=0, column=5, sticky="e")
+        ttk.Label(titlef, text="Vertical position (Y %):").grid(row=1, column=5, sticky="e")
         self.title_y_pct_var = tk.DoubleVar(value=float(self.profile.get("title_y_pct", 96.0)))
-        ttk.Spinbox(titlef, from_=0.0, to=100.0, increment=0.5, textvariable=self.title_y_pct_var, width=8, justify="right").grid(row=0, column=6, sticky="w", padx=(6, 12))
+        ttk.Spinbox(titlef, from_=0.0, to=100.0, increment=0.5, textvariable=self.title_y_pct_var, width=8, justify="right").grid(row=1, column=6, sticky="w", padx=(6, 12))
 
-        # Subtitle section
+        ttk.Label(titlef, text="Font:").grid(row=1, column=7, sticky="e")
+        self.title_font_family_var = tk.StringVar(value=self.profile.get("title_font_family", "Helvetica"))
+        ttk.Combobox(titlef, textvariable=self.title_font_family_var, values=self._font_families, width=18, state="readonly").grid(row=1, column=8, sticky="w", padx=(6, 12))
+
+        # Subtitle section (FORMAT + TEXT)
         subf = ttk.LabelFrame(container, text="Subtitle")
         subf.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(subf, text="Color:").grid(row=0, column=0, sticky="e")
+
+        ttk.Label(subf, text="Text:").grid(row=0, column=0, sticky="e")
+        self.subtitle_text_var = tk.StringVar(value=(self.profile.get("bindings", {}) or {}).get("subtitle", ""))
+        ttk.Entry(subf, textvariable=self.subtitle_text_var, width=48).grid(row=0, column=1, columnspan=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(subf, text="Color:").grid(row=1, column=0, sticky="e")
         self.subtitle_color_var = tk.StringVar(value=self.profile.get("subtitle_color", "#333333"))
-        ttk.Entry(subf, textvariable=self.subtitle_color_var, width=12).grid(row=0, column=1, sticky="w", padx=(6, 6))
-        ttk.Button(subf, text="Pick…", command=lambda: self._choose_color(self.subtitle_color_var)).grid(row=0, column=2, sticky="w")
+        ttk.Entry(subf, textvariable=self.subtitle_color_var, width=12).grid(row=1, column=1, sticky="w", padx=(6, 6))
+        ttk.Button(subf, text="Pick…", command=lambda: self._choose_color(self.subtitle_color_var)).grid(row=1, column=2, sticky="w")
 
-        ttk.Label(subf, text="Text size:").grid(row=0, column=3, sticky="e")
+        ttk.Label(subf, text="Text size:").grid(row=1, column=3, sticky="e")
         self.subtitle_size_var = tk.IntVar(value=int(self.profile.get("subtitle_font_size", 12)))
-        ttk.Spinbox(subf, from_=8, to=48, increment=1, textvariable=self.subtitle_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
+        ttk.Spinbox(subf, from_=8, to=48, increment=1, textvariable=self.subtitle_size_var, width=6, justify="right").grid(row=1, column=4, sticky="w", padx=(6, 12))
 
-        ttk.Label(subf, text="Vertical position (Y %):").grid(row=0, column=5, sticky="e")
+        ttk.Label(subf, text="Vertical position (Y %):").grid(row=1, column=5, sticky="e")
         self.subtitle_y_pct_var = tk.DoubleVar(value=float(self.profile.get("subtitle_y_pct", 86.0)))
-        ttk.Spinbox(subf, from_=0.0, to=100.0, increment=0.5, textvariable=self.subtitle_y_pct_var, width=8, justify="right").grid(row=0, column=6, sticky="w", padx=(6, 12))
+        ttk.Spinbox(subf, from_=0.0, to=100.0, increment=0.5, textvariable=self.subtitle_y_pct_var, width=8, justify="right").grid(row=1, column=6, sticky="w", padx=(6, 12))
+
+        ttk.Label(subf, text="Font:").grid(row=1, column=7, sticky="e")
+        self.subtitle_font_family_var = tk.StringVar(value=self.profile.get("subtitle_font_family", "Helvetica"))
+        ttk.Combobox(subf, textvariable=self.subtitle_font_family_var, values=self._font_families, width=18, state="readonly").grid(row=1, column=8, sticky="w", padx=(6, 12))
 
         # Labels section
         labf = ttk.LabelFrame(container, text="Labels")
@@ -913,6 +942,10 @@ class App(ttk.Frame):
         self.label_value_gap_pct_var = tk.DoubleVar(value=float(self.profile.get("label_value_gap_pct", 10.0)))
         ttk.Spinbox(labf, from_=0.0, to=40.0, increment=0.5, textvariable=self.label_value_gap_pct_var, width=8, justify="right").grid(row=1, column=4, sticky="w", padx=(6, 12), pady=(6, 0))
 
+        ttk.Label(labf, text="Font:").grid(row=0, column=7, sticky="e")
+        self.labels_font_family_var = tk.StringVar(value=self.profile.get("labels_font_family", "Helvetica"))
+        ttk.Combobox(labf, textvariable=self.labels_font_family_var, values=self._font_families, width=18, state="readonly").grid(row=0, column=8, sticky="w", padx=(6, 12))
+
         # Values section
         valf = ttk.LabelFrame(container, text="Label Values")
         valf.pack(fill="x", padx=10, pady=(0, 6))
@@ -925,7 +958,11 @@ class App(ttk.Frame):
         self.values_size_var = tk.IntVar(value=int(self.profile.get("values_font_size", 11)))
         ttk.Spinbox(valf, from_=8, to=36, increment=1, textvariable=self.values_size_var, width=6, justify="right").grid(row=0, column=4, sticky="w", padx=(6, 12))
 
-        # Graph Axis section (only meaningful when graph is ON)
+        ttk.Label(valf, text="Font:").grid(row=0, column=7, sticky="e")
+        self.values_font_family_var = tk.StringVar(value=self.profile.get("values_font_family", "Helvetica"))
+        ttk.Combobox(valf, textvariable=self.values_font_family_var, values=self._font_families, width=18, state="readonly").grid(row=0, column=8, sticky="w", padx=(6, 12))
+
+        # Graph Axis section
         axf = ttk.LabelFrame(container, text="Graph Axis & Line")
         axf.pack(fill="x", padx=10, pady=(0, 6))
         ttk.Label(axf, text="Axis label size:").grid(row=0, column=0, sticky="e")
@@ -949,6 +986,10 @@ class App(ttk.Frame):
         self.grid_enabled_var = tk.BooleanVar(value=bool(self.profile.get("grid_enabled", True)))
         ttk.Checkbutton(axf, text="Show grid", variable=self.grid_enabled_var).grid(row=1, column=3, sticky="w", pady=(6, 0))
 
+        ttk.Label(axf, text="Axis font:").grid(row=0, column=7, sticky="e")
+        self.axis_font_family_var = tk.StringVar(value=self.profile.get("axis_font_family", "Helvetica"))
+        ttk.Combobox(axf, textvariable=self.axis_font_family_var, values=self._font_families, width=18, state="readonly").grid(row=0, column=8, sticky="w", padx=(6, 12))
+
         # Logo section (applies with or without graph)
         logof = ttk.LabelFrame(container, text="Logo (applies to all templates)")
         logof.pack(fill="x", padx=10, pady=(0, 10))
@@ -956,7 +997,7 @@ class App(ttk.Frame):
         ttk.Checkbutton(logof, text="Include logo", variable=self.logo_enabled_var).grid(row=0, column=0, sticky="w")
 
         ttk.Label(logof, text="Path:").grid(row=0, column=1, sticky="e")
-        self.tpl_logo_path_var = tk.StringVar(value=self.profile.get("bindings", {}).get("logo_path", ""))  # keep compatibility
+        self.tpl_logo_path_var = tk.StringVar(value=self.profile.get("bindings", {}).get("logo_path", ""))
         ttk.Entry(logof, textvariable=self.tpl_logo_path_var, width=48).grid(row=0, column=2, columnspan=2, sticky="w", padx=(6, 6))
         ttk.Button(logof, text="Browse…", command=self._browse_logo).grid(row=0, column=4, sticky="w")
 
@@ -1002,8 +1043,7 @@ class App(ttk.Frame):
         # Traces and initial sync
         self._attach_profile_traces()
         self._sync_profile_to_ui()
-        self._ensure_graph_ui_ready()
-    
+        self._ensure_graph_ui_ready()    
     # ========== Bindings tab ==========
     def _build_tab_bindings(self):
         tab = ttk.Frame(self.nb)
@@ -1611,20 +1651,21 @@ class App(ttk.Frame):
         for nm in ("win_var","hin_var","margin_var","text_scale_var","plotw_var","graph_margin_var"):
             _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
-        # Title
-        for nm in ("title_color_var","title_size_var","title_y_pct_var"):
+        # Title (format + text)
+        for nm in ("title_text_var","title_color_var","title_size_var","title_y_pct_var","title_font_family_var"):
             _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
-        # Subtitle
-        for nm in ("subtitle_color_var","subtitle_size_var","subtitle_y_pct_var"):
+        # Subtitle (format + text)
+        for nm in ("subtitle_text_var","subtitle_color_var","subtitle_size_var","subtitle_y_pct_var","subtitle_font_family_var"):
             _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
         # Labels and Values
-        for nm in ("labels_color_var","labels_size_var","rows_top_y_pct_var","line_height_pct_var","label_value_gap_pct_var","values_color_var","values_size_var"):
+        for nm in ("labels_color_var","labels_size_var","rows_top_y_pct_var","line_height_pct_var","label_value_gap_pct_var","labels_font_family_var",
+                "values_color_var","values_size_var","values_font_family_var"):
             _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
 
         # Graph axis & line
-        for nm in ("axis_label_size_var","axis_tick_size_var","axis_color_var","graph_line_color_var"):
+        for nm in ("axis_label_size_var","axis_tick_size_var","axis_color_var","graph_line_color_var","axis_font_family_var"):
             _safe_add_trace(getattr(self, nm, None), lambda *a: self._schedule_autosave())
         _safe_add_trace(getattr(self, "grid_enabled_var", None), lambda *a: self._schedule_autosave())
 
@@ -1648,7 +1689,7 @@ class App(ttk.Frame):
 
         # Template text saves on focus-out (if present)
         try:
-            if hasattr(self, "template_text") and getattr(self, "template_text") is not None:
+            if hasattr(self, "template_text") and self.template_text is not None:
                 self.template_text.bind("<FocusOut>", lambda e: self._schedule_autosave())
         except Exception:
             pass
@@ -1693,12 +1734,12 @@ class App(ttk.Frame):
         self.profile.setdefault("template", {})
         tpl = self.profile["template"]
 
-        # Mode & Size
+        # === Mode & Size (clamped) ===
         try: tpl["include_graph"] = bool(self.include_graph_var.get())
         except Exception: pass
-        try: self.profile["label_w_in"] = float(self.win_var.get())
+        try: self.profile["label_w_in"] = self._clamp_inch(self.win_var.get(), self.profile.get("label_w_in", 3.0))
         except Exception: pass
-        try: self.profile["label_h_in"] = float(self.hin_var.get())
+        try: self.profile["label_h_in"] = self._clamp_inch(self.hin_var.get(), self.profile.get("label_h_in", 4.0))
         except Exception: pass
         try: self.profile["margin_pct"] = int(self.margin_var.get())
         except Exception: pass
@@ -1709,7 +1750,32 @@ class App(ttk.Frame):
         try: self.profile["graph_margin_pct"] = int(self.graph_margin_var.get())
         except Exception: pass
 
-        # Title
+        # Bindings: Title and Subtitle text (used by renderer)
+        b = self.profile.setdefault("bindings", {})
+        try:
+            if hasattr(self, "title_text_var"):
+                b["title"] = (self.title_text_var.get() or "").strip()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "subtitle_text_var"):
+                b["subtitle"] = (self.subtitle_text_var.get() or "").strip()
+        except Exception:
+            pass
+
+        # Fonts (persist selections)
+        try: self.profile["title_font_family"] = (self.title_font_family_var.get() or "Helvetica").strip()
+        except Exception: pass
+        try: self.profile["subtitle_font_family"] = (self.subtitle_font_family_var.get() or "Helvetica").strip()
+        except Exception: pass
+        try: self.profile["labels_font_family"] = (self.labels_font_family_var.get() or "Helvetica").strip()
+        except Exception: pass
+        try: self.profile["values_font_family"] = (self.values_font_family_var.get() or "Helvetica").strip()
+        except Exception: pass
+        try: self.profile["axis_font_family"] = (self.axis_font_family_var.get() or "Helvetica").strip()
+        except Exception: pass
+
+        # Title formatting
         try: self.profile["title_color"] = (self.title_color_var.get() or DEFAULT_TITLE_COLOR).strip()
         except Exception: pass
         try: self.profile["title_font_size"] = int(self.title_size_var.get())
@@ -1717,7 +1783,7 @@ class App(ttk.Frame):
         try: self.profile["title_y_pct"] = float(self.title_y_pct_var.get())
         except Exception: pass
 
-        # Subtitle (format only; text lives in bindings["subtitle"])
+        # Subtitle formatting
         try: self.profile["subtitle_color"] = (self.subtitle_color_var.get() or "#333333").strip()
         except Exception: pass
         try: self.profile["subtitle_font_size"] = int(self.subtitle_size_var.get())
@@ -1725,7 +1791,7 @@ class App(ttk.Frame):
         try: self.profile["subtitle_y_pct"] = float(self.subtitle_y_pct_var.get())
         except Exception: pass
 
-        # Labels / Values
+        # Labels / Values formatting
         try: self.profile["labels_color"] = (self.labels_color_var.get() or "#333333").strip()
         except Exception: pass
         try: self.profile["labels_font_size"] = int(self.labels_size_var.get())
@@ -1753,8 +1819,7 @@ class App(ttk.Frame):
         try: self.profile["grid_enabled"] = bool(self.grid_enabled_var.get())
         except Exception: pass
 
-        # Logo (path kept in bindings for compatibility; on/off + formatting here)
-        b = self.profile.setdefault("bindings", {})
+        # Logo (path kept in bindings for compatibility; enable/format here)
         try:
             if hasattr(self, "tpl_logo_path_var") and self.tpl_logo_path_var.get() is not None:
                 b["logo_path"] = self.tpl_logo_path_var.get().strip()
@@ -1813,26 +1878,25 @@ class App(ttk.Frame):
             )
             if not path:
                 return
-            if not getattr(self, "bv_logo_var", None):
-                self.bv_logo_var = tk.StringVar()
-            self.bv_logo_var.set(path)
-            self._on_profile_field_change()
-            self._set_status(f"Logo selected: {path}")
+            if not hasattr(self, "tpl_logo_path_var"):
+                self.tpl_logo_path_var = tk.StringVar()
+            self.tpl_logo_path_var.set(path)
+            # Keep path in bindings for compatibility
+            b = self.profile.setdefault("bindings", {})
+            b["logo_path"] = path
+            save_profile(self.profile)
+            self._set_status(f"Logo: {path}")
         except Exception as e:
-            try:
-                messagebox.showerror("Error", f"Failed to select logo: {e}")
-            except Exception:
-                pass
+            messagebox.showerror("Logo", f"Failed to select logo: {e}")
 
     def _get_font_families(self):
-        """Return a sorted list of installed font family names for dropdowns."""
         try:
             import tkinter.font as tkfont
             fams = sorted(set(tkfont.families()))
             self._font_families = fams
             return fams
         except Exception:
-            fams = ["Helvetica", "Times New Roman", "Courier New", "Arial"]
+            fams = ["Helvetica", "Arial", "Segoe UI", "Times New Roman", "Courier New"]
             self._font_families = fams
             return fams
 
@@ -1907,6 +1971,7 @@ class App(ttk.Frame):
 
         # Template & Layout
         tpl = self.profile.get("template", {}) or {}
+        b = self.profile.get("bindings", {}) or {}
 
         # Mode & Size
         try: self.include_graph_var.set(bool(tpl.get("include_graph", False)))
@@ -1924,7 +1989,29 @@ class App(ttk.Frame):
         try: self.graph_margin_var.set(int(self.profile.get("graph_margin_pct", self.profile.get("margin_pct", DEFAULT_MARGIN_PCT))))
         except Exception: pass
 
-        # Title
+        # Title/Subtitle text from bindings
+        try:
+            if hasattr(self, "title_text_var"):
+                self.title_text_var.set(b.get("title", ""))
+        except Exception: pass
+        try:
+            if hasattr(self, "subtitle_text_var"):
+                self.subtitle_text_var.set(b.get("subtitle", ""))
+        except Exception: pass
+
+        # Fonts
+        try: self.title_font_family_var.set(self.profile.get("title_font_family", "Helvetica"))
+        except Exception: pass
+        try: self.subtitle_font_family_var.set(self.profile.get("subtitle_font_family", "Helvetica"))
+        except Exception: pass
+        try: self.labels_font_family_var.set(self.profile.get("labels_font_family", "Helvetica"))
+        except Exception: pass
+        try: self.values_font_family_var.set(self.profile.get("values_font_family", "Helvetica"))
+        except Exception: pass
+        try: self.axis_font_family_var.set(self.profile.get("axis_font_family", "Helvetica"))
+        except Exception: pass
+
+        # Title formatting
         try: self.title_color_var.set(self.profile.get("title_color", DEFAULT_TITLE_COLOR))
         except Exception: pass
         try: self.title_size_var.set(int(self.profile.get("title_font_size", 16)))
@@ -1932,7 +2019,7 @@ class App(ttk.Frame):
         try: self.title_y_pct_var.set(float(self.profile.get("title_y_pct", 96.0)))
         except Exception: pass
 
-        # Subtitle
+        # Subtitle formatting
         try: self.subtitle_color_var.set(self.profile.get("subtitle_color", "#333333"))
         except Exception: pass
         try: self.subtitle_size_var.set(int(self.profile.get("subtitle_font_size", 12)))
@@ -1970,7 +2057,6 @@ class App(ttk.Frame):
 
         # Logo
         try:
-            # path from bindings for compatibility
             self.tpl_logo_path_var.set(self.profile.get("bindings", {}).get("logo_path", ""))
         except Exception: pass
         try: self.logo_enabled_var.set(bool(self.profile.get("logo_enabled", False)))
