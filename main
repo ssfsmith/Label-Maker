@@ -153,44 +153,63 @@ class LayoutEditor(ttk.Frame):
     All positions stored as percentages of the inner label area (or the 'left' area for text/columns in graph mode),
     matching the fields your renderer reads.
     """
-    def __init__(self, parent, app, width=720, height=420):
-        super().__init__(parent)
-        self.app = app
-        self.W = width
-        self.H = height
-        self.bg = "#f7f7fa"
-        self.snap = tk.BooleanVar(value=True)
-        self.show_guides = tk.BooleanVar(value=True)
+    def __init__(self, master):
+        super().__init__(master)
+        self.master.title(APP_TITLE)
+        self.pack(fill="both", expand=True)
 
-        # Canvas
-        self.canvas = tk.Canvas(self, width=self.W, height=self.H, bg=self.bg, highlightthickness=1, highlightbackground="#ccc")
-        self.canvas.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=(0, 8), pady=(0, 8))
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        # State
+        self.df: Optional[pd.DataFrame] = None
+        self.xlsx_path: Optional[str] = None
+        self.current_row_index: Optional[int] = None
+        self.profile: Dict = default_profile(TEMPLATE_GRAPH)
+        self.last_pdf: Optional[Path] = None
 
-        # Controls row
-        ttk.Checkbutton(self, text="Snap to grid", variable=self.snap, command=self.refresh).grid(row=1, column=0, sticky="w")
-        ttk.Checkbutton(self, text="Show guides", variable=self.show_guides, command=self.refresh).grid(row=1, column=1, sticky="w")
-        ttk.Button(self, text="Reset layout", command=self.reset_layout).grid(row=1, column=2, sticky="w")
+        # Vars that are referenced in multiple tabs — define early
+        self.outdir_var = tk.StringVar(value=str(Path.cwd()))
 
-        # Sliders
-        self.line_h_var = tk.DoubleVar(value=float(self._tpl("line_height_pct", 0.075)))
-        self.graph_margin_var = tk.IntVar(value=int(self._tpl("graph_margin_pct", self._profile("margin_pct", 7))))
-        ttk.Label(self, text="Line height").grid(row=2, column=0, sticky="w")
-        ttk.Scale(self, from_=0.04, to=0.12, orient="horizontal", variable=self.line_h_var, command=lambda *_: self._on_line_h_change()).grid(row=2, column=1, sticky="we", padx=(6, 12))
-        ttk.Label(self, text="Graph margin %").grid(row=2, column=2, sticky="e")
-        ttk.Spinbox(self, from_=0, to=25, width=5, textvariable=self.graph_margin_var, command=self._on_graph_margin_change, justify="right").grid(row=2, column=3, sticky="w")
+        # Keep references to comboboxes
+        self.slot_col_cbs: List[ttk.Combobox] = []
+        self.g_slot_col_cbs: List[ttk.Combobox] = []
 
-        # Internal: canvas items
-        self.items = {}
-        self.drag = {"item": None, "kind": None, "dx": 0, "dy": 0, "anchor": None}
+        # Autosave debounce
+        self._autosave_after_id = None
 
-        # Bind mouse
-        self.canvas.bind("<Button-1>", self._on_down)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_up)
+        # Style
+        self._init_style()
 
-        self.refresh()
+        # Status (init BEFORE building tabs so _set_status works during init)
+        self.status_var = tk.StringVar(value="")
+        status = ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w")
+        status.pack(fill="x", padx=0, pady=(2, 0), ipady=2)
+
+        # Notebook
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=8, pady=6)
+
+        # Build tabs: Profile, Bindings, Actions, Data Source (last)
+        self._build_tab_profiles()
+        self._build_tab_bindings()
+        self._build_tab_actions()
+        self._build_tab_data()
+
+        # Profiles list
+        self._refresh_profile_list()
+
+        # Auto-load a profile at startup, if one exists
+        try:
+            names = list_profiles()
+            pref = self.profile.get("profile_name")
+            if pref and pref in names:
+                self.profile_pick_var.set(pref)
+                self._load_selected_profile()
+            elif names:
+                self.profile_pick_var.set(names[0])
+                self._load_selected_profile()
+        except Exception:
+            pass
+
+        self.master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # --------- profile helpers ---------
     def _profile(self, key, default=None):
@@ -687,6 +706,10 @@ class App(ttk.Frame):
         path = self.xlsx_var.get() or self.xlsx_path
         try:
             self.df = read_excel_sheet(path, self.sheet_var.get())
+
+            # Ensure binding dropdowns/listbox reflect new columns immediately
+            self._refresh_binding_columns()      # <-- added early
+
             self.profile.setdefault("data_source", {})
             self.profile["data_source"]["xlsx_path"] = path
             self.profile["data_source"]["sheet"] = self.sheet_var.get()
@@ -697,8 +720,13 @@ class App(ttk.Frame):
             saved_serial_col = self.profile.get("data_source", {}).get("serial_col")
             self.serial_col_var.set(saved_serial_col if saved_serial_col in cols else guess)
 
-            # Populate serials and bindings, then make graph UI ready
+            # Populate serials (also selects a row)
             self._refresh_serials()
+
+            # Second refresh is harmless; makes sure columns persist after serial selection
+            self._refresh_binding_columns()
+            self._render_selected_cols_view()
+
             self._ensure_graph_ui_ready()
 
             self._set_status(f"Loaded sheet: {self.sheet_var.get()} ({len(self.df)} rows, {len(self.df.columns)} cols)")
@@ -1049,118 +1077,134 @@ class App(ttk.Frame):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="Bindings")
 
-        # Header (fixed, non-scrolling)
+        # Header
         self._make_profile_header(tab)
 
+        # Scroll container
         sf = ScrollableFrame(tab)
         sf.pack(fill="both", expand=True, padx=6, pady=6)
+        container = sf.scrollable_frame
 
-        # Action row
-        action_row = ttk.Frame(sf.scrollable_frame)
-        action_row.pack(fill="x", padx=10, pady=(4, 2))
-        ttk.Button(action_row, text="Save Bindings", command=self.on_save_bindings).pack(side="right")
-        ttk.Label(action_row, text="(Pick flow columns and slot columns, then Save Bindings)").pack(side="right", padx=(0, 8))
+        b = self._bindings_get()
 
-        # Graph bindings
-        self.bind_graph = ttk.LabelFrame(sf.scrollable_frame, text="Graph Bindings")
-        self.bind_graph.pack(fill="x", padx=10, pady=6)
+        # ------------- Graph bindings -------------
+        gf = ttk.LabelFrame(container, text="Graph Bindings")
+        gf.pack(fill="x", padx=10, pady=(6, 10))
 
-        self.bg_title_var = tk.StringVar(value=self.profile.get("bindings", {}).get("title", "Neb Label"))
-        self.bg_inc_trend_var = tk.BooleanVar(value=bool(self.profile.get("bindings", {}).get("include_trendline", True)))
-        ttk.Label(self.bind_graph, text="Title:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.bind_graph, textvariable=self.bg_title_var, width=36).grid(row=0, column=1, sticky="w", padx=(6, 12))
-        ttk.Checkbutton(self.bind_graph, text="Include trendline", variable=self.bg_inc_trend_var).grid(row=0, column=2, sticky="w")
+        left = ttk.Frame(gf)
+        right = ttk.Frame(gf)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nsew")
+        gf.columnconfigure(0, weight=1)
+        gf.columnconfigure(1, weight=1)
 
-        ttk.Label(self.bind_graph, text="Flow columns (X):").grid(row=1, column=0, sticky="nw", pady=(8, 0))
-        self.list_cols = tk.Listbox(self.bind_graph, selectmode="multiple", width=48, height=12, exportselection=False)
-        try:
-            self.list_cols.configure(selectbackground="#0E6CD6", selectforeground="white")
-        except Exception:
-            pass
-        self.list_cols.grid(row=1, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(8, 0))
+        ttk.Label(left, text="Flow columns (X):").pack(anchor="w")
+        self.list_cols = tk.Listbox(left, selectmode="extended", height=10, exportselection=False)
+        self.list_cols.pack(fill="both", expand=True, pady=(4, 4))
 
-        # Right-side selected text panel (top-to-bottom)
-        sel_panel = ttk.Frame(self.bind_graph)
-        sel_panel.grid(row=1, column=4, sticky="nw", padx=(12, 0), pady=(8, 0))
-        ttk.Label(sel_panel, text="Selected (top to bottom):").pack(anchor="w")
-        self.selected_cols_text = tk.Text(sel_panel, width=28, height=12, wrap="none")
+        def on_xcols_change(event=None):
+            try:
+                sel = [self.list_cols.get(i) for i in self.list_cols.curselection()]
+            except Exception:
+                sel = []
+            self._bindings_get()["x_flow_columns"] = sel
+            try:
+                save_profile(self.profile)
+                self._schedule_autosave()
+            except Exception:
+                pass
+            self._render_selected_cols_view()
+
+        self.list_cols.bind("<<ListboxSelect>>", on_xcols_change)
+
+        ttk.Label(right, text="Selected X columns:").pack(anchor="w")
+        self.selected_cols_text = tk.Text(right, height=10, wrap="none")
+        self.selected_cols_text.pack(fill="both", expand=True, pady=(4, 4))
         self.selected_cols_text.configure(state="disabled")
-        self.selected_cols_text.pack(fill="both", expand=False, pady=(4, 0))
 
-        self.list_cols.bind("<<ListboxSelect>>", lambda e: (self._on_profile_field_change(), self._render_selected_cols_view()))
+        # Trendline
+        self.g_include_trendline_var = tk.BooleanVar(value=bool(b.get("include_trendline", True)))
 
-        # Graph: Value slots (optional) — dynamic count
-        ttk.Label(self.bind_graph, text="Value Slots (optional):").grid(row=3, column=0, sticky="w", pady=(10, 2))
-        self.g_slot_label_vars = []
-        self.g_slot_col_vars = []
-        self.g_slot_col_cbs = []
+        def on_trendline_toggle():
+            self._bindings_get()["include_trendline"] = bool(self.g_include_trendline_var.get())
+            try:
+                save_profile(self.profile); self._schedule_autosave()
+            except Exception:
+                pass
 
-        slots_count = int(self.profile.get("template", {}).get("slots_count", 10))
-        row = 4
-        for i in range(1, slots_count + 1):
-            labv = tk.StringVar()
-            colv = tk.StringVar()
-            self.g_slot_label_vars.append(labv)
-            self.g_slot_col_vars.append(colv)
-            ttk.Label(self.bind_graph, text=f"Label {i}:").grid(row=row, column=0, sticky="w")
-            ent = ttk.Entry(self.bind_graph, textvariable=labv, width=24)
-            ent.grid(row=row, column=1, sticky="w", padx=(6, 12))
-            ent.bind("<FocusOut>", lambda e: self._on_profile_field_change())
-            ttk.Label(self.bind_graph, text=f"Value {i} column:").grid(row=row, column=2, sticky="w")
-            cb = ttk.Combobox(self.bind_graph, textvariable=colv, width=24, state="readonly")
-            cb.grid(row=row, column=3, sticky="w", padx=(6, 12))
-            cb.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_profile_field_change())
-            self.g_slot_col_cbs.append(cb)
-            row += 1
+        ttk.Checkbutton(
+            gf, text="Include trendline",
+            variable=self.g_include_trendline_var,
+            command=on_trendline_toggle
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        # Value bindings (non-graph)
-        self.bind_values = ttk.LabelFrame(sf.scrollable_frame, text="Value Bindings")
-        self.bv_title_var = tk.StringVar()
-        self.bv_subtitle_var = tk.StringVar()
-        self.bv_logo_var = tk.StringVar()
+        # ------------- Value bindings (15) -------------
+        vf = ttk.LabelFrame(container, text="Value Bindings (Shown on label)")
+        vf.pack(fill="x", padx=10, pady=(0, 10))
 
-        row = 0
-        ttk.Label(self.bind_values, text="Title:").grid(row=row, column=0, sticky="w"); row += 1
-        e = ttk.Entry(self.bind_values, textvariable=self.bv_title_var, width=36)
-        e.grid(row=row-1, column=1, sticky="w", padx=(6, 12))
-        e.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
+        header = ttk.Frame(vf)
+        header.grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Inc").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(header, text="Label").grid(row=0, column=1, padx=(0, 6))
+        ttk.Label(header, text="Column").grid(row=0, column=2, padx=(0, 6))
 
-        ttk.Label(self.bind_values, text="Subtitle:").grid(row=row, column=0, sticky="w"); row += 1
-        e2 = ttk.Entry(self.bind_values, textvariable=self.bv_subtitle_var, width=36)
-        e2.grid(row=row-1, column=1, sticky="w", padx=(6, 12))
-        e2.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
-
-        ttk.Label(self.bind_values, text="Logo path:").grid(row=row, column=0, sticky="w"); row += 1
-        le = ttk.Entry(self.bind_values, textvariable=self.bv_logo_var, width=48)
-        le.grid(row=row-1, column=1, sticky="w", padx=(6, 6))
-        ttk.Button(self.bind_values, text="Browse...", command=self._browse_logo).grid(row=row-1, column=2, sticky="w")
-        le.bind("<FocusOut>", lambda ev: self._on_profile_field_change())
-
+        self.slot_enabled_vars = []
         self.slot_label_vars = []
-        self.slot_col_vars = []
         self.slot_col_cbs = []
 
-        slots_count = int(self.profile.get("template", {}).get("slots_count", 10))
-        for i in range(1, slots_count + 1):
-            labv = tk.StringVar()
-            colv = tk.StringVar()
-            self.slot_label_vars.append(labv)
-            self.slot_col_vars.append(colv)
-            ttk.Label(self.bind_values, text=f"Label {i}:").grid(row=row, column=0, sticky="w")
-            ent = ttk.Entry(self.bind_values, textvariable=labv, width=24)
-            ent.grid(row=row, column=1, sticky="w", padx=(6, 12))
-            ent.bind("<FocusOut>", lambda e: self._on_profile_field_change())
-            ttk.Label(self.bind_values, text=f"Value {i} column:").grid(row=row, column=2, sticky="w")
-            cb = ttk.Combobox(self.bind_values, textvariable=colv, width=24, state="readonly")
-            cb.grid(row=row, column=3, sticky="w", padx=(6, 12))
-            cb.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_profile_field_change())
-            self.slot_col_cbs.append(cb)
-            row += 1
+        cols = [str(c) for c in self.df.columns] if isinstance(getattr(self, "df", None), pd.DataFrame) else []
 
-        self._toggle_binding_panels()
-        self._refresh_binding_columns()
+        for i in range(1, 16):
+            rowi = ttk.Frame(vf)
+            rowi.grid(row=i, column=0, sticky="we", pady=2)
+            vf.columnconfigure(0, weight=1)
+
+            en_var = tk.BooleanVar(value=bool(b.get(f"slot{i}_enabled", True)))
+            lbl_var = tk.StringVar(value=(b.get(f"slot{i}_label", "") or ""))
+            col_val = b.get(f"slot{i}_col", "")
+
+            def make_enable_cb(ix, var):
+                def _cb():
+                    self._bindings_set_slot(ix, enabled=bool(var.get()))
+                return _cb
+
+            ttk.Checkbutton(rowi, variable=en_var, command=make_enable_cb(i, en_var)).grid(row=0, column=0, padx=(0, 6), sticky="w")
+
+            ent = ttk.Entry(rowi, textvariable=lbl_var, width=28)
+            ent.grid(row=0, column=1, padx=(0, 6), sticky="w")
+
+            def make_label_save(ix, var):
+                return lambda e: self._bindings_set_slot(ix, label=(var.get() or "").strip())
+
+            ent.bind("<FocusOut>", make_label_save(i, lbl_var))
+
+            cb = ttk.Combobox(rowi, state="readonly", values=cols, width=28)
+            cb.grid(row=0, column=2, padx=(0, 6), sticky="w")
+            try:
+                if col_val and col_val in cols:
+                    cb.set(col_val)
+                else:
+                    cb.set("")
+            except Exception:
+                pass
+
+            def make_col_save(ix, combobox):
+                return lambda e: self._bindings_set_slot(ix, col=(combobox.get() or "").strip())
+
+            cb.bind("<<ComboboxSelected>>", make_col_save(i, cb))
+
+            self.slot_enabled_vars.append(en_var)
+            self.slot_label_vars.append(lbl_var)
+            self.slot_col_cbs.append(cb)
+
+        # Save button
+        ttk.Button(container, text="Save Bindings", command=self._on_save_bindings).pack(anchor="e", padx=10, pady=(4, 6))
+
+        # Populate UI from current df if already loaded
         try:
-            self._render_selected_cols_view()
+            if isinstance(getattr(self, "df", None), pd.DataFrame):
+                self._refresh_binding_columns()
+                self._render_selected_cols_view()
         except Exception:
             pass
         
@@ -1324,159 +1368,79 @@ class App(ttk.Frame):
             pass
 
 
+    def _bindings_get(self) -> Dict:
+        return self.profile.setdefault("bindings", {})
+
+    def _bindings_set_slot(self, i: int, *, label: Optional[str] = None, col: Optional[str] = None, enabled: Optional[bool] = None):
+        b = self._bindings_get()
+        if label is not None:
+            b[f"slot{i}_label"] = label
+        if col is not None:
+            b[f"slot{i}_col"] = col
+        if enabled is not None:
+            b[f"slot{i}_enabled"] = bool(enabled)
+        try:
+            save_profile(self.profile)
+            self._schedule_autosave()
+        except Exception:
+            pass
+
+    def _on_save_bindings(self):
+        try:
+            save_profile(self.profile)
+            self._flash_message("Bindings saved", 1200)
+        except Exception as e:
+            messagebox.showerror("Save Bindings", f"Failed to save bindings: {e}")
+
     def _refresh_binding_columns(self):
         """
-        Rebuild binding choices from self.df and re-apply saved selections.
-
-        - Populates the Flow columns (X) listbox with current df columns.
-        - Re-applies saved selections from profile['bindings']['x_flow_columns'].
-        - Updates the right-side selected text panel.
-        - Populates slot column comboboxes (graph and non-graph) with df columns,
-        and re-applies saved selections that still exist.
-        - Also re-applies the slot LABEL text into the entry fields so the user's
-        typed labels remain visible after saving or toggling modes.
-        - Adds an explicit '(none)' option for value-column comboboxes.
-        - Defensive: safe if widgets or df are not yet available.
+        Refresh Flow column listbox and all value slot column comboboxes
+        after (re)loading the Excel sheet. Retains prior selections if they still exist.
         """
-        NONE_LABEL = "(none)"
-
-        # 1) Collect column names from the loaded DataFrame
         try:
-            cols = list(self.df.columns) if getattr(self, "df", None) is not None else []
-        except Exception:
-            cols = []
-        cols_with_none = [NONE_LABEL] + cols
+            df = getattr(self, "df", None)
+            if isinstance(df, pd.DataFrame):
+                cols = [str(c) for c in df.columns.tolist()]
+            else:
+                cols = []
+            b = self._bindings_get()
 
-        # 2) Load saved bindings (defensive)
-        try:
-            b = self.profile.get("bindings", {}) if getattr(self, "profile", None) else {}
-        except Exception:
-            b = {}
-
-        # 3) Flow columns listbox
-        try:
-            if hasattr(self, "list_cols") and self.list_cols is not None:
-                # Refresh entries
+            # Graph flow columns listbox
+            if hasattr(self, "list_cols"):
                 try:
-                    self.list_cols.delete(0, tk.END)
+                    self.list_cols.delete(0, "end")
                     for c in cols:
-                        self.list_cols.insert(tk.END, c)
-                except Exception:
-                    pass
+                        self.list_cols.insert("end", c)
+                    # Re-select persisted flow columns
+                    xcols = b.get("x_flow_columns", [])
+                    if isinstance(xcols, str):
+                        xcols = [x.strip() for x in xcols.split("|") if x.strip()]
+                    existing = self.list_cols.get(0, "end")
+                    for idx, name in enumerate(existing):
+                        if name in xcols:
+                            self.list_cols.selection_set(idx)
+                    self._render_selected_cols_view()
+                except Exception as e:
+                    self._set_status(f"Flow col refresh error: {e}")
 
-                # Re-apply saved selections (accept list or '|' separated string)
-                saved = b.get("x_flow_columns", []) or []
-                if isinstance(saved, str):
-                    saved = [s.strip() for s in saved.split("|") if s.strip()]
-                try:
-                    self.list_cols.selection_clear(0, tk.END)
-                except Exception:
-                    pass
+            # Value slot comboboxes
+            if hasattr(self, "slot_col_cbs") and self.slot_col_cbs:
+                for i, cb in enumerate(self.slot_col_cbs, start=1):
+                    try:
+                        cb['values'] = cols  # reliable assignment
+                        current = b.get(f"slot{i}_col", "")
+                        if current and current in cols:
+                            cb.set(current)
+                        else:
+                            cb.set("")
+                    except Exception as e:
+                        self._set_status(f"Slot {i} refresh error: {e}")
 
-                try:
-                    # Map saved names to current indices; ignore names not in current df
-                    name_to_idx = {name: i for i, name in enumerate(cols)}
-                    for name in saved:
-                        idx = name_to_idx.get(name)
-                        if idx is not None:
-                            try:
-                                self.list_cols.selection_set(idx)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 4) Graph slot combobox options and selections + label text (Value Slots under Graph Bindings)
-        try:
-            for cb in getattr(self, "g_slot_col_cbs", []) or []:
-                try:
-                    cb["values"] = cols_with_none
-                except Exception:
-                    pass
-
-            # Determine how many graph slot rows we actually have in the UI (fixed 6 in this file)
-            try:
-                g_n = min(len(getattr(self, "g_slot_label_vars", []) or []),
-                        len(getattr(self, "g_slot_col_vars", []) or []))
-            except Exception:
-                g_n = 0
-
-            for i in range(g_n):
-                idx = i + 1
-                # Value column
-                key_col = f"slot{idx}_col"
-                val_col = (b.get(key_col, "") or "").strip()
-                try:
-                    if not val_col or val_col not in cols:
-                        self.g_slot_col_vars[i].set(NONE_LABEL)
-                    else:
-                        self.g_slot_col_vars[i].set(val_col)
-                except Exception:
-                    pass
-
-                # Label text
-                key_lab = f"slot{idx}_label"
-                val_lab = (b.get(key_lab, "") or "")
-                try:
-                    self.g_slot_label_vars[i].set(val_lab)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 5) Non-graph (Value Bindings) slot combobox options/selections + label text
-        try:
-            for cb in getattr(self, "slot_col_cbs", []) or []:
-                try:
-                    cb["values"] = cols_with_none
-                except Exception:
-                    pass
-
-            # Determine how many non-graph slot rows we have (fixed 6 in this file)
-            try:
-                n_n = min(len(getattr(self, "slot_label_vars", []) or []),
-                        len(getattr(self, "slot_col_vars", []) or []))
-            except Exception:
-                n_n = 0
-
-            for i in range(n_n):
-                idx = i + 1
-                # Value column
-                key_col = f"slot{idx}_col"
-                val_col = (b.get(key_col, "") or "").strip()
-                try:
-                    if not val_col or val_col not in cols:
-                        self.slot_col_vars[i].set(NONE_LABEL)
-                    else:
-                        self.slot_col_vars[i].set(val_col)
-                except Exception:
-                    pass
-
-                # Label text
-                key_lab = f"slot{idx}_label"
-                val_lab = (b.get(key_lab, "") or "")
-                try:
-                    self.slot_label_vars[i].set(val_lab)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 6) Update the right-side selected view to match current listbox selection
-        try:
-            if hasattr(self, "_render_selected_cols_view"):
-                self._render_selected_cols_view()
-        except Exception:
-            pass
-
-        # 7) Reflect graph/value mode enable/disable states
-        try:
-            if hasattr(self, "_update_graph_controls_visibility"):
-                self._update_graph_controls_visibility()
-        except Exception:
-            pass
+            # Diagnostics
+            if not cols:
+                self._set_status("No columns loaded (sheet may not be loaded yet).")
+        except Exception as e:
+            self._set_status(f"_refresh_binding_columns failed: {e}")
 
 
     def _toggle_binding_panels(self):
@@ -1969,6 +1933,9 @@ class App(ttk.Frame):
             except Exception:
                 pass
 
+
+
+
         # Template & Layout
         tpl = self.profile.get("template", {}) or {}
         b = self.profile.get("bindings", {}) or {}
@@ -2088,6 +2055,12 @@ class App(ttk.Frame):
         try:
             if not self.outdir_var.get():
                 self.outdir_var.set(str(Path.cwd()))
+        except Exception:
+            pass
+
+        try: 
+            if isinstance(getattr(self, "df", None), pd.DataFrame):
+                self._refresh_binding_columns()
         except Exception:
             pass
 
@@ -2383,8 +2356,23 @@ class App(ttk.Frame):
         return var.get().strip() if out["ok"] else None
 
     def _set_status(self, msg: str):
-        self.status_var.set(msg)
-        self.update_idletasks()
+        """
+        Safe status setter. If status bar not initialized yet, just print.
+        """
+        try:
+            if hasattr(self, "status_var") and self.status_var is not None:
+                try:
+                    self.status_var.set(msg)
+                    return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fallback when status_var not yet created (early init) or fails
+        try:
+            print(str(msg))
+        except Exception:
+            pass
 
     def on_close(self):
         try:
