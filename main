@@ -494,6 +494,7 @@ class LayoutEditor(ttk.Frame):
         self.refresh()
 
 class App(ttk.Frame):
+    
     def __init__(self, master):
         super().__init__(master)
         self.master.title(APP_TITLE)
@@ -506,10 +507,10 @@ class App(ttk.Frame):
         self.profile: Dict = default_profile(TEMPLATE_GRAPH)
         self.last_pdf: Optional[Path] = None
 
-        # Vars that are referenced in multiple tabs — define early
+        # Vars shared across tabs
         self.outdir_var = tk.StringVar(value=str(Path.cwd()))
 
-        # Keep references to comboboxes
+        # References to binding widgets
         self.slot_col_cbs: List[ttk.Combobox] = []
         self.g_slot_col_cbs: List[ttk.Combobox] = []
 
@@ -519,25 +520,25 @@ class App(ttk.Frame):
         # Style
         self._init_style()
 
+        # STATUS BAR FIRST (so early status calls don’t crash)
+        self.status_var = tk.StringVar(value="")
+        status = ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w")
+        status.pack(fill="x", padx=0, pady=(2, 0), ipady=2)
+
         # Notebook
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=8, pady=6)
 
-        # Build tabs: Profile, Bindings, Actions, Data Source (last)
+        # Tabs
         self._build_tab_profiles()
         self._build_tab_bindings()
         self._build_tab_actions()
         self._build_tab_data()
 
-        # Status
-        self.status_var = tk.StringVar(value="")
-        status = ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w")
-        status.pack(fill="x", padx=0, pady=(2, 0), ipady=2)
-
         # Profiles list
         self._refresh_profile_list()
 
-        # Auto-load a profile at startup, if one exists
+        # Auto-load if any profile exists
         try:
             names = list_profiles()
             pref = self.profile.get("profile_name")
@@ -707,8 +708,8 @@ class App(ttk.Frame):
         try:
             self.df = read_excel_sheet(path, self.sheet_var.get())
 
-            # Ensure binding dropdowns/listbox reflect new columns immediately
-            self._refresh_binding_columns()      # <-- added early
+            # EARLY refresh so bindings see columns immediately
+            self._refresh_binding_columns()
 
             self.profile.setdefault("data_source", {})
             self.profile["data_source"]["xlsx_path"] = path
@@ -720,10 +721,10 @@ class App(ttk.Frame):
             saved_serial_col = self.profile.get("data_source", {}).get("serial_col")
             self.serial_col_var.set(saved_serial_col if saved_serial_col in cols else guess)
 
-            # Populate serials (also selects a row)
+            # Populate serials and pick a row
             self._refresh_serials()
 
-            # Second refresh is harmless; makes sure columns persist after serial selection
+            # SECOND refresh (ok if redundant) ensures columns persisted after serial selection
             self._refresh_binding_columns()
             self._render_selected_cols_view()
 
@@ -1073,6 +1074,7 @@ class App(ttk.Frame):
         self._sync_profile_to_ui()
         self._ensure_graph_ui_ready()    
     # ========== Bindings tab ==========
+
     def _build_tab_bindings(self):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="Bindings")
@@ -1087,7 +1089,7 @@ class App(ttk.Frame):
 
         b = self._bindings_get()
 
-        # ------------- Graph bindings -------------
+        # --- Graph bindings ---
         gf = ttk.LabelFrame(container, text="Graph Bindings")
         gf.pack(fill="x", padx=10, pady=(6, 10))
 
@@ -1122,7 +1124,7 @@ class App(ttk.Frame):
         self.selected_cols_text.pack(fill="both", expand=True, pady=(4, 4))
         self.selected_cols_text.configure(state="disabled")
 
-        # Trendline
+        # Trendline toggle
         self.g_include_trendline_var = tk.BooleanVar(value=bool(b.get("include_trendline", True)))
 
         def on_trendline_toggle():
@@ -1138,7 +1140,7 @@ class App(ttk.Frame):
             command=on_trendline_toggle
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        # ------------- Value bindings (15) -------------
+        # --- Value bindings (15) ---
         vf = ttk.LabelFrame(container, text="Value Bindings (Shown on label)")
         vf.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -1200,7 +1202,7 @@ class App(ttk.Frame):
         # Save button
         ttk.Button(container, text="Save Bindings", command=self._on_save_bindings).pack(anchor="e", padx=10, pady=(4, 6))
 
-        # Populate UI from current df if already loaded
+        # If a sheet already loaded before we built this tab, populate immediately
         try:
             if isinstance(getattr(self, "df", None), pd.DataFrame):
                 self._refresh_binding_columns()
@@ -1371,7 +1373,8 @@ class App(ttk.Frame):
     def _bindings_get(self) -> Dict:
         return self.profile.setdefault("bindings", {})
 
-    def _bindings_set_slot(self, i: int, *, label: Optional[str] = None, col: Optional[str] = None, enabled: Optional[bool] = None):
+    def _bindings_set_slot(self, i: int, *, label: Optional[str] = None,
+                        col: Optional[str] = None, enabled: Optional[bool] = None):
         b = self._bindings_get()
         if label is not None:
             b[f"slot{i}_label"] = label
@@ -1385,6 +1388,7 @@ class App(ttk.Frame):
         except Exception:
             pass
 
+
     def _on_save_bindings(self):
         try:
             save_profile(self.profile)
@@ -1394,8 +1398,8 @@ class App(ttk.Frame):
 
     def _refresh_binding_columns(self):
         """
-        Refresh Flow column listbox and all value slot column comboboxes
-        after (re)loading the Excel sheet. Retains prior selections if they still exist.
+        Refresh Flow column listbox and value slot column comboboxes after sheet load.
+        Keeps previous selections if still valid.
         """
         try:
             df = getattr(self, "df", None)
@@ -1405,13 +1409,12 @@ class App(ttk.Frame):
                 cols = []
             b = self._bindings_get()
 
-            # Graph flow columns listbox
+            # Flow columns listbox (graph X columns)
             if hasattr(self, "list_cols"):
                 try:
                     self.list_cols.delete(0, "end")
                     for c in cols:
                         self.list_cols.insert("end", c)
-                    # Re-select persisted flow columns
                     xcols = b.get("x_flow_columns", [])
                     if isinstance(xcols, str):
                         xcols = [x.strip() for x in xcols.split("|") if x.strip()]
@@ -1427,7 +1430,7 @@ class App(ttk.Frame):
             if hasattr(self, "slot_col_cbs") and self.slot_col_cbs:
                 for i, cb in enumerate(self.slot_col_cbs, start=1):
                     try:
-                        cb['values'] = cols  # reliable assignment
+                        cb['values'] = cols
                         current = b.get(f"slot{i}_col", "")
                         if current and current in cols:
                             cb.set(current)
@@ -1436,9 +1439,8 @@ class App(ttk.Frame):
                     except Exception as e:
                         self._set_status(f"Slot {i} refresh error: {e}")
 
-            # Diagnostics
             if not cols:
-                self._set_status("No columns loaded (sheet may not be loaded yet).")
+                self._set_status("No columns loaded (sheet not loaded yet).")
         except Exception as e:
             self._set_status(f"_refresh_binding_columns failed: {e}")
 
@@ -1934,8 +1936,6 @@ class App(ttk.Frame):
                 pass
 
 
-
-
         # Template & Layout
         tpl = self.profile.get("template", {}) or {}
         b = self.profile.get("bindings", {}) or {}
@@ -2357,18 +2357,14 @@ class App(ttk.Frame):
 
     def _set_status(self, msg: str):
         """
-        Safe status setter. If status bar not initialized yet, just print.
+        Safe status setter. If status bar not initialized yet, print instead.
         """
         try:
             if hasattr(self, "status_var") and self.status_var is not None:
-                try:
-                    self.status_var.set(msg)
-                    return
-                except Exception:
-                    pass
+                self.status_var.set(str(msg))
+                return
         except Exception:
             pass
-        # Fallback when status_var not yet created (early init) or fails
         try:
             print(str(msg))
         except Exception:
