@@ -701,37 +701,94 @@ class App(ttk.Frame):
             messagebox.showerror("Error", f"Error reading Excel: {e}")
             self._set_status(f"Error reading Excel: {e}")
 
+    def _normalize_date_columns(self, date_columns: List[str]):
+        """
+        Normalize Excel date columns to pure date objects (YYYY-MM-DD friendly).
+        - If column is numeric, treat as Excel serial (days since 1899-12-30).
+        - If column is string/mixed, parse with pandas to_datetime.
+        - Result: self.df[col] becomes dtype=object of Python date (no time).
+        """
+        try:
+            if not isinstance(getattr(self, "df", None), pd.DataFrame):
+                return
+            for col in date_columns:
+                if col not in self.df.columns:
+                    continue
+                s = self.df[col]
+                # Numeric Excel serial -> datetime
+                if np.issubdtype(s.dtype, np.number):
+                    base = pd.to_datetime("1899-12-30")
+                    self.df[col] = pd.to_datetime(base) + pd.to_timedelta(pd.to_numeric(s, errors="coerce"), unit="D")
+                else:
+                    # Strings/mixed -> datetime (coerce invalid to NaT)
+                    self.df[col] = pd.to_datetime(self.df[col], errors="coerce", dayfirst=False)
+                # Keep date part only
+                try:
+                    self.df[col] = self.df[col].dt.date
+                except Exception:
+                    # If not datetime-like, leave as-is
+                    pass
+        except Exception as e:
+            self._set_status(f"_normalize_date_columns error: {e}")
+
     def _load_sheet(self):
+        """
+        Load the selected Excel sheet into self.df, update data-source metadata, refresh
+        serial picker, and refresh all binding column dropdowns (graph + value slots).
+        Runs two refresh passes (early and after serial selection) to guarantee columns
+        appear even if widgets were built before the sheet was loaded.
+        Also normalizes date columns so they display consistently on labels.
+        """
         if not (self.xlsx_var.get() or self.xlsx_path) or not self.sheet_var.get():
             return
         path = self.xlsx_var.get() or self.xlsx_path
         try:
+            # Read sheet
             self.df = read_excel_sheet(path, self.sheet_var.get())
+
+            # Normalize any date columns you want (adjust names to match your sheet)
+            try:
+                self._normalize_date_columns(["Date Tested"])  # <-- edit list as needed
+            except Exception:
+                pass
 
             # EARLY refresh so bindings see columns immediately
             self._refresh_binding_columns()
+            try: self._force_enable_value_bindings()
+            except Exception: pass
 
-            self.profile.setdefault("data_source", {})
-            self.profile["data_source"]["xlsx_path"] = path
-            self.profile["data_source"]["sheet"] = self.sheet_var.get()
+            # Persist data source info
+            ds = self.profile.setdefault("data_source", {})
+            ds["xlsx_path"] = path
+            ds["sheet"] = self.sheet_var.get()
 
+            # Serial column guess / restore
             cols = list(self.df.columns)
             self.serial_col_menu["values"] = cols
-            guess = next((c for c in cols if "serial" in str(c).lower()), cols[0] if cols else "")
-            saved_serial_col = self.profile.get("data_source", {}).get("serial_col")
+            guess = next((c for c in cols if "serial" in str(c).lower()),
+                        cols[0] if cols else "")
+            saved_serial_col = ds.get("serial_col")
             self.serial_col_var.set(saved_serial_col if saved_serial_col in cols else guess)
 
-            # Populate serials and pick a row
+            # Refresh serial list (also selects a row if possible)
             self._refresh_serials()
 
-            # SECOND refresh (ok if redundant) ensures columns persisted after serial selection
+            # SECOND refresh after serial selection (harmless if duplicate)
             self._refresh_binding_columns()
+            try: self._force_enable_value_bindings()
+            except Exception: pass
             self._render_selected_cols_view()
 
+            # Ensure graph-specific UI adjusts (splitter, etc.)
             self._ensure_graph_ui_ready()
 
-            self._set_status(f"Loaded sheet: {self.sheet_var.get()} ({len(self.df)} rows, {len(self.df.columns)} cols)")
+            # Status + save
+            self._set_status(
+                f"Loaded sheet: {self.sheet_var.get()} "
+                f"({len(self.df)} rows, {len(self.df.columns)} cols)"
+            )
             save_profile(self.profile)
+
         except Exception as e:
             self.df = None
             messagebox.showerror("Error", f"Error loading sheet: {e}")
@@ -1079,10 +1136,8 @@ class App(ttk.Frame):
         tab = ttk.Frame(self.nb)
         self.nb.add(tab, text="Bindings")
 
-        # Header
         self._make_profile_header(tab)
 
-        # Scroll container
         sf = ScrollableFrame(tab)
         sf.pack(fill="both", expand=True, padx=6, pady=6)
         container = sf.scrollable_frame
@@ -1104,7 +1159,7 @@ class App(ttk.Frame):
         self.list_cols = tk.Listbox(left, selectmode="extended", height=10, exportselection=False)
         self.list_cols.pack(fill="both", expand=True, pady=(4, 4))
 
-        def on_xcols_change(event=None):
+        def on_xcols_change(_=None):
             try:
                 sel = [self.list_cols.get(i) for i in self.list_cols.curselection()]
             except Exception:
@@ -1124,21 +1179,16 @@ class App(ttk.Frame):
         self.selected_cols_text.pack(fill="both", expand=True, pady=(4, 4))
         self.selected_cols_text.configure(state="disabled")
 
-        # Trendline toggle
         self.g_include_trendline_var = tk.BooleanVar(value=bool(b.get("include_trendline", True)))
-
         def on_trendline_toggle():
             self._bindings_get()["include_trendline"] = bool(self.g_include_trendline_var.get())
             try:
                 save_profile(self.profile); self._schedule_autosave()
             except Exception:
                 pass
-
-        ttk.Checkbutton(
-            gf, text="Include trendline",
-            variable=self.g_include_trendline_var,
-            command=on_trendline_toggle
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(gf, text="Include trendline",
+                        variable=self.g_include_trendline_var,
+                        command=on_trendline_toggle).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         # --- Value bindings (15) ---
         vf = ttk.LabelFrame(container, text="Value Bindings (Shown on label)")
@@ -1152,9 +1202,26 @@ class App(ttk.Frame):
 
         self.slot_enabled_vars = []
         self.slot_label_vars = []
+        self.slot_label_entries = []
         self.slot_col_cbs = []
+        self.slot_enabled_chks = []
 
         cols = [str(c) for c in self.df.columns] if isinstance(getattr(self, "df", None), pd.DataFrame) else []
+        dropdown_values = ["<None>"] + cols  # prepend sentinel
+
+        # Simple debounce for label autosave
+        self._label_save_after_ids = {}
+
+        def schedule_label_save(ix, var):
+            # Cancel previous
+            aid = self._label_save_after_ids.get(ix)
+            if aid:
+                try: self.after_cancel(aid)
+                except Exception: pass
+            def do_save():
+                self._bindings_set_slot(ix, label=(var.get() or "").strip())
+                self._label_save_after_ids.pop(ix, None)
+            self._label_save_after_ids[ix] = self.after(300, do_save)
 
         for i in range(1, 16):
             rowi = ttk.Frame(vf)
@@ -1165,51 +1232,115 @@ class App(ttk.Frame):
             lbl_var = tk.StringVar(value=(b.get(f"slot{i}_label", "") or ""))
             col_val = b.get(f"slot{i}_col", "")
 
-            def make_enable_cb(ix, var):
-                def _cb():
-                    self._bindings_set_slot(ix, enabled=bool(var.get()))
-                return _cb
-
-            ttk.Checkbutton(rowi, variable=en_var, command=make_enable_cb(i, en_var)).grid(row=0, column=0, padx=(0, 6), sticky="w")
+            chk = ttk.Checkbutton(rowi, variable=en_var)
+            chk.grid(row=0, column=0, padx=(0, 6), sticky="w")
 
             ent = ttk.Entry(rowi, textvariable=lbl_var, width=28)
             ent.grid(row=0, column=1, padx=(0, 6), sticky="w")
 
-            def make_label_save(ix, var):
-                return lambda e: self._bindings_set_slot(ix, label=(var.get() or "").strip())
+            ent.bind("<FocusOut>", lambda e, ix=i, v=lbl_var: self._bindings_set_slot(ix, label=(v.get() or "").strip()))
+            ent.bind("<KeyRelease>", lambda e, ix=i, v=lbl_var: schedule_label_save(ix, v))
 
-            ent.bind("<FocusOut>", make_label_save(i, lbl_var))
-
-            cb = ttk.Combobox(rowi, state="readonly", values=cols, width=28)
+            cb = ttk.Combobox(rowi, state="readonly", values=dropdown_values, width=28, takefocus=True)
             cb.grid(row=0, column=2, padx=(0, 6), sticky="w")
-            try:
-                if col_val and col_val in cols:
-                    cb.set(col_val)
+            # Initialize selection
+            if col_val and col_val in cols:
+                cb.set(col_val)
+            else:
+                cb.set("<None>")
+
+            def on_col_select(event, ix=i, combo=cb):
+                choice = combo.get()
+                if choice == "<None>":
+                    self._bindings_set_slot(ix, col="")
                 else:
-                    cb.set("")
-            except Exception:
-                pass
+                    self._bindings_set_slot(ix, col=choice)
 
-            def make_col_save(ix, combobox):
-                return lambda e: self._bindings_set_slot(ix, col=(combobox.get() or "").strip())
+            cb.bind("<<ComboboxSelected>>", on_col_select)
 
-            cb.bind("<<ComboboxSelected>>", make_col_save(i, cb))
+            # Allow Delete key to clear selection
+            def on_delete_key(event, ix=i, combo=cb):
+                combo.set("<None>")
+                self._bindings_set_slot(ix, col="")
+            cb.bind("<Delete>", on_delete_key)
+            cb.bind("<BackSpace>", on_delete_key)
+
+            def make_enable_cb(ix, var, entry, combo):
+                def _cb():
+                    enabled = bool(var.get())
+                    self._bindings_set_slot(ix, enabled=enabled)
+                    try:
+                        entry.configure(state="normal" if enabled else "disabled")
+                        combo.configure(state="readonly" if enabled else "disabled")
+                    except Exception:
+                        pass
+                return _cb
+            chk.configure(command=make_enable_cb(i, en_var, ent, cb))
 
             self.slot_enabled_vars.append(en_var)
             self.slot_label_vars.append(lbl_var)
+            self.slot_label_entries.append(ent)
             self.slot_col_cbs.append(cb)
+            self.slot_enabled_chks.append(chk)
 
-        # Save button
-        ttk.Button(container, text="Save Bindings", command=self._on_save_bindings).pack(anchor="e", padx=10, pady=(4, 6))
+        ttk.Button(container, text="Save Bindings",
+                command=self._on_save_bindings).pack(anchor="e", padx=10, pady=(4, 6))
 
-        # If a sheet already loaded before we built this tab, populate immediately
+        # Populate if sheet already loaded
         try:
             if isinstance(getattr(self, "df", None), pd.DataFrame):
                 self._refresh_binding_columns()
-                self._render_selected_cols_view()
+        except Exception:
+            pass
+
+        try:
+            self._force_enable_value_bindings()
         except Exception:
             pass
         
+        # Populate if sheet already loaded
+        try:
+            if isinstance(getattr(self, "df", None), pd.DataFrame):
+                self._refresh_binding_columns()
+                # Now sync saved labels into entries
+                self._sync_value_binding_entries()
+        except Exception:
+            pass
+
+        try:
+            self._force_enable_value_bindings()
+        except Exception:
+            pass
+        
+    def _force_enable_value_bindings(self):
+        """
+        Ensure each Value Binding row is enabled if its Include is checked.
+        Keeps comboboxes clickable (state='readonly'), entries 'normal'.
+        """
+        try:
+            count = min(
+                len(getattr(self, "slot_enabled_vars", [])),
+                len(getattr(self, "slot_label_entries", [])),
+                len(getattr(self, "slot_col_cbs", [])),
+                len(getattr(self, "slot_enabled_chks", [])),
+            )
+            for idx in range(count):
+                enabled = bool(self.slot_enabled_vars[idx].get())
+                try:
+                    self.slot_enabled_chks[idx].configure(state="normal")
+                except Exception:
+                    pass
+                try:
+                    self.slot_label_entries[idx].configure(state="normal" if enabled else "disabled")
+                except Exception:
+                    pass
+                try:
+                    self.slot_col_cbs[idx].configure(state="readonly" if enabled else "disabled")
+                except Exception:
+                    pass
+        except Exception as e:
+            self._set_status(f"_force_enable_value_bindings: {e}")
+
     def _ensure_graph_ui_ready(self):
         """
         Ensure the graph-related UI is fully initialized and interactive.
@@ -1396,20 +1527,53 @@ class App(ttk.Frame):
         except Exception as e:
             messagebox.showerror("Save Bindings", f"Failed to save bindings: {e}")
 
+    def _flush_all_label_bindings(self):
+        """
+        Force-save all label text entries (slots 1..15) into bindings.
+        """
+        b = self._bindings_get()
+        for i, var in enumerate(getattr(self, "slot_label_vars", []), start=1):
+            try:
+                b[f"slot{i}_label"] = (var.get() or "").strip()
+            except Exception:
+                pass
+        try:
+            save_profile(self.profile)
+            self._schedule_autosave()
+            self._set_status("All label bindings flushed.")
+        except Exception:
+            pass
+
+    def _sync_value_binding_entries(self):
+        """
+        Push saved bindings slot{i}_label strings into the UI Entry variables.
+        Safe to call any time after Bindings tab is built.
+        """
+        try:
+            b = self._bindings_get()
+            if not hasattr(self, "slot_label_vars"):
+                return
+            count = len(self.slot_label_vars)
+            for i in range(1, count + 1):
+                var = self.slot_label_vars[i - 1]
+                saved = (b.get(f"slot{i}_label", "") or "")
+                # Only set if different (avoid clobbering in-progress typing)
+                if var.get() != saved:
+                    var.set(saved)
+        except Exception as e:
+            self._set_status(f"_sync_value_binding_entries error: {e}")
+
     def _refresh_binding_columns(self):
         """
-        Refresh Flow column listbox and value slot column comboboxes after sheet load.
-        Keeps previous selections if still valid.
+        Refresh flow columns listbox and value slot dropdowns.
+        Keeps prior selections; keeps '<None>' as clear option.
         """
         try:
             df = getattr(self, "df", None)
-            if isinstance(df, pd.DataFrame):
-                cols = [str(c) for c in df.columns.tolist()]
-            else:
-                cols = []
+            cols = [str(c) for c in df.columns.tolist()] if isinstance(df, pd.DataFrame) else []
             b = self._bindings_get()
 
-            # Flow columns listbox (graph X columns)
+            # Flow columns listbox
             if hasattr(self, "list_cols"):
                 try:
                     self.list_cols.delete(0, "end")
@@ -1428,16 +1592,22 @@ class App(ttk.Frame):
 
             # Value slot comboboxes
             if hasattr(self, "slot_col_cbs") and self.slot_col_cbs:
+                dd_vals = ["<None>"] + cols
                 for i, cb in enumerate(self.slot_col_cbs, start=1):
                     try:
-                        cb['values'] = cols
+                        cb['values'] = dd_vals
                         current = b.get(f"slot{i}_col", "")
                         if current and current in cols:
                             cb.set(current)
                         else:
-                            cb.set("")
+                            cb.set("<None>")
                     except Exception as e:
                         self._set_status(f"Slot {i} refresh error: {e}")
+
+            try:
+                self._force_enable_value_bindings()
+            except Exception:
+                pass
 
             if not cols:
                 self._set_status("No columns loaded (sheet not loaded yet).")
@@ -2075,6 +2245,13 @@ class App(ttk.Frame):
         try: self._update_profile_header()
         except Exception:
             pass
+        # Sync saved value binding labels into the UI
+        try:
+            self._sync_value_binding_entries()
+        except Exception:
+            pass
+
+
 
     def _sync_ui_to_profile(self):
         self._on_profile_field_change()
@@ -2228,6 +2405,10 @@ class App(ttk.Frame):
                 pass
 
             self._set_status(f"Profile loaded: {name}")
+            try:
+                self._sync_value_binding_entries()
+            except Exception:
+                pass
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load profile: {e}")
 
