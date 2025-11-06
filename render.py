@@ -2,7 +2,7 @@ import re
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, Sequence
-
+import datetime as dt
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -94,6 +94,49 @@ def _clamp(v: float, lo: float, hi: float, default: Optional[float] = None) -> f
 
 def _clamp_pct(v: float, default: float = 0.0) -> float:
     return _clamp(v, 0.0, 100.0, default)
+
+def format_cell_value(v) -> str:
+    """
+    Format a cell value for display:
+    - datetime/timestamp/date -> YYYY-MM-DD
+    - numeric Excel serial (heuristic 30000..60000) -> convert to date
+    - numeric -> formatted number
+    - string -> stripped
+    - None/NaN -> empty
+    """
+    try:
+        if v is None or (hasattr(pd, "isna") and pd.isna(v)):
+            return ""
+        # Pandas timestamp or datetime
+        if isinstance(v, (pd.Timestamp, dt.datetime)):
+            return v.strftime("%Y-%m-%d")
+        # Python date
+        if isinstance(v, dt.date):
+            return v.strftime("%Y-%m-%d")
+        # Numeric
+        if isinstance(v, (int, float, np.floating)):
+            fv = float(v)
+            # Heuristic range for Excel serial dates (~1982..2064)
+            if 30000 < fv < 60000:
+                base = pd.to_datetime("1899-12-30")
+                d = base + pd.to_timedelta(fv, unit="D")
+                try:
+                    return d.strftime("%Y-%m-%d")
+                except Exception:
+                    return str(d)
+            # regular numeric
+            return fmt_opt_num(fv, 2)
+        # Strings
+        if isinstance(v, str):
+            return v.strip()
+        # Fallback
+        return str(v)
+    except Exception:
+        try:
+            return str(v).strip()
+        except Exception:
+            return ""
+
 
 def _safe_inches(val, default, lo=0.5, hi=24.0) -> float:
     # coerce to float with default, then clamp to sane inches
@@ -856,10 +899,16 @@ def render_profile_to_pdf(
     row: pd.Series,
     out_pdf: Path,
 ):
+    """
+    High-level: read settings from profile, pull values from row, and render to PDF.
+    Supports:
+      - Graph label -> Letter two-up (default) or 3x4, includes value slots on left
+      - Value labels (A/B/C) -> 3x4 (default) or Letter two-up, with distinct styles
+    """
     template_id = profile.get("template_id", TEMPLATE_GRAPH)
     b = profile.get("bindings", {}) or {}
 
-    # Use bindings["title"] here (not profile name)
+    # Use bindings["title"] for main title
     title = (b.get("title") or "").strip() or "Neb Label"
     subtitle = (b.get("subtitle") or "").strip()
 
@@ -871,7 +920,7 @@ def render_profile_to_pdf(
     graph_line_color = profile.get("graph_line_color", DEFAULT_GRAPH_LINE_COLOR)
     graph_margin_pct = int(profile.get("graph_margin_pct", margin_pct))
 
-    # Formatting fields
+    # Formatting fields (safe defaults applied inside draw)
     fmt = {
         # Title
         "title_font_family": profile.get("title_font_family"),
@@ -910,15 +959,19 @@ def render_profile_to_pdf(
         "grid_enabled": bool(profile.get("grid_enabled", True)),
     }
 
+    # Build value entries (1..15), format values smartly (dates, numbers, strings)
     def build_entries() -> List[Tuple[str, str]]:
         entries: List[Tuple[str, str]] = []
-        for i in range(1, 25):
+        for i in range(1, 16):
+            enabled = b.get(f"slot{i}_enabled", True)
+            if not enabled:
+                continue
             lab = (b.get(f"slot{i}_label", "") or "").strip()
             col = (b.get(f"slot{i}_col", "") or "").strip()
             val = ""
-            if col and col in df.columns:
-                v = row.get(col)
-                val = fmt_opt_num(v, 2) if isinstance(v, (int, float, np.floating)) else ("" if (pd.isna(v) if hasattr(pd, "isna") else False) else str(v))
+            if col and df is not None and (col in df.columns):
+                raw = row.get(col)
+                val = format_cell_value(raw)
             entries.append((lab, val))
         while entries and not any(entries[-1]):
             entries.pop()
